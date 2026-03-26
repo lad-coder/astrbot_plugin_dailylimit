@@ -43,6 +43,7 @@ ConfigManager = None
 Limiter = None
 Security = None
 UsageTracker = None
+_import_error = None
 try:
     # 添加当前目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -50,8 +51,8 @@ try:
         sys.path.insert(0, current_dir)
 
     from core import Logger, RedisClient, ConfigManager, Limiter, Security, UsageTracker
-except ImportError:
-    pass
+except ImportError as e:
+    _import_error = str(e)
 
 
 @star.register(
@@ -91,9 +92,8 @@ class DailyLimitPlugin(star.Star):
         # 初始化核心模块（必须最先初始化，因为其他代码依赖日志）
         if Logger is None or RedisClient is None or ConfigManager is None or Limiter is None or Security is None or UsageTracker is None:
             # 核心模块导入失败，无法继续
-            raise RuntimeError(
-                "核心模块导入失败，请确保 core/ 目录存在且包含所有必需模块"
-            )
+            error_msg = f"核心模块导入失败。导入错误: {_import_error}"
+            raise RuntimeError(error_msg)
 
         # 所有核心模块都可用，进行初始化
         self.logger = Logger(self)
