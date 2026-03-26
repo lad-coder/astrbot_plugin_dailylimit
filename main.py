@@ -43,12 +43,14 @@ except ImportError:
 
 # 核心模块导入
 try:
-    from core import Logger, RedisClient, ConfigManager, Limiter
+    from core import Logger, RedisClient, ConfigManager, Limiter, Security, UsageTracker
 except ImportError:
     Logger = None
     RedisClient = None
     ConfigManager = None
     Limiter = None
+    Security = None
+    UsageTracker = None
 
 
 @star.register(
@@ -86,18 +88,25 @@ class DailyLimitPlugin(star.Star):
         self.zero_usage_notified_users = {}  # 零使用次数提醒记录 {"user_id": last_notified_timestamp}
 
         # 初始化核心模块（必须最先初始化，因为其他代码依赖日志）
-        if Logger is None or RedisClient is None or ConfigManager is None or Limiter is None:
+        if Logger is None or RedisClient is None or ConfigManager is None or Limiter is None or Security is None or UsageTracker is None:
             # 核心模块导入失败，使用内置实现
             print("警告: 核心模块导入失败，使用内置实现")
             self.logger = None
             self.redis_client = None
             self.config_mgr = None
             self.limiter = None
+            self.security = None
+            self.usage_tracker = None
         else:
             self.logger = Logger(self)
             self.redis_client = RedisClient(self)
             self.config_mgr = ConfigManager(self)
             self.limiter = Limiter(self)
+            self.security = Security(self)
+            self.usage_tracker = UsageTracker(self)
+
+            # 加载安全配置
+            self.security.load_security_config()
 
         # 加载群组和用户特定限制
         if self.config_mgr:
@@ -111,6 +120,13 @@ class DailyLimitPlugin(star.Star):
         else:
             # 使用内置实现（兼容旧代码）
             self._load_limits_from_config()
+
+        # 将安全模块数据引用到实例变量，保持向后兼容
+        if self.security:
+            self.abuse_records = self.security.abuse_records
+            self.blocked_users = self.security.blocked_users
+            self.abuse_stats = self.security.abuse_stats
+            self.anti_abuse_enabled = self.security.anti_abuse_enabled
 
         # 初始化Redis连接
         self._init_redis()
@@ -732,7 +748,7 @@ class DailyLimitPlugin(star.Star):
         self.notified_users = {}
         self.notified_admins = {}
 
-    def _detect_abuse_behavior(self, user_id, timestamp):
+    def _detect_abuse_behavior(self, user_id, timestamp=None):
         """检测异常使用行为
 
         这是异常检测的主入口函数，负责协调整个检测流程。
@@ -750,6 +766,10 @@ class DailyLimitPlugin(star.Star):
                 - block_until (float, 可选): 限制结束时间戳
                 - original_reason (str, 可选): 原始限制原因
         """
+        if self.security:
+            return self.security.detect_abuse_behavior(user_id, timestamp)
+
+        # 使用内置实现（兼容旧代码）
         if not self.anti_abuse_enabled:
             return {"is_abuse": False, "reason": "防刷机制未启用"}
 
@@ -1001,6 +1021,10 @@ class DailyLimitPlugin(star.Star):
         返回:
             dict: 包含限制信息的字典
         """
+        if self.security:
+            return await self.security.block_user_for_abuse(user_id, reason, duration)
+
+        # 使用内置实现（兼容旧代码）
         try:
             user_id = str(user_id)
             block_duration = duration or self.auto_block_duration
@@ -1868,6 +1892,10 @@ class DailyLimitPlugin(star.Star):
         返回：
             bool: 记录成功返回True，失败返回False
         """
+        if self.usage_tracker:
+            return self.usage_tracker.record_usage(user_id, group_id, usage_type)
+
+        # 使用内置实现（兼容旧代码）
         if not self.redis:
             return False
 
