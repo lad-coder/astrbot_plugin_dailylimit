@@ -46,6 +46,9 @@ Security = None
 UsageTracker = None
 MessageBuilder = None
 VersionChecker = None
+HelpManager = None
+StatsAnalyzer = None
+TimePeriodManager = None
 _import_error = None
 
 def _load_core_module(module_name):
@@ -71,6 +74,9 @@ try:
     UsageTracker = _load_core_module("usage_tracker").UsageTracker
     MessageBuilder = _load_core_module("message_builder").MessageBuilder
     VersionChecker = _load_core_module("version_checker").VersionChecker
+    HelpManager = _load_core_module("help_manager").HelpManager
+    StatsAnalyzer = _load_core_module("stats_analyzer").StatsAnalyzer
+    TimePeriodManager = _load_core_module("time_period_manager").TimePeriodManager
 except Exception as e:
     _import_error = str(e)
 
@@ -110,7 +116,7 @@ class DailyLimitPlugin(star.Star):
         self.zero_usage_notified_users = {}  # 零使用次数提醒记录 {"user_id": last_notified_timestamp}
 
         # 初始化核心模块（必须最先初始化，因为其他代码依赖日志）
-        if Logger is None or RedisClient is None or ConfigManager is None or Limiter is None or Security is None or UsageTracker is None or MessageBuilder is None or VersionChecker is None:
+        if Logger is None or RedisClient is None or ConfigManager is None or Limiter is None or Security is None or UsageTracker is None or MessageBuilder is None or VersionChecker is None or HelpManager is None or StatsAnalyzer is None or TimePeriodManager is None:
             # 核心模块导入失败，无法继续
             error_msg = f"核心模块导入失败。导入错误: {_import_error}"
             raise RuntimeError(error_msg)
@@ -124,6 +130,9 @@ class DailyLimitPlugin(star.Star):
         self.usage_tracker = UsageTracker(self)
         self.message_builder = MessageBuilder(self)
         self.version_checker = VersionChecker(self)
+        self.help_manager = HelpManager(self)
+        self.stats_analyzer = StatsAnalyzer(self)
+        self.time_period_mgr = TimePeriodManager(self)
 
         # 加载安全配置
         self.security.load_security_config()
@@ -377,116 +386,6 @@ class DailyLimitPlugin(star.Star):
             self.group_modes[group_id] = mode
         else:
             self._log_warning("群组模式配置格式错误: {}", line)
-
-    def _parse_time_period_limits(self):
-        """解析时间段限制配置"""
-        time_period_value = self.config["limits"].get("time_period_limits", "")
-
-        # 处理配置值，兼容字符串和列表两种格式
-        if isinstance(time_period_value, str):
-            # 如果是字符串，按换行符分割并过滤空值
-            lines = [
-                line.strip()
-                for line in time_period_value.strip().split("\n")
-                if line.strip()
-            ]
-        elif isinstance(time_period_value, list):
-            # 如果是列表，确保所有元素都是字符串并过滤空值
-            lines = [
-                str(line).strip() for line in time_period_value if str(line).strip()
-            ]
-        else:
-            # 其他类型，转换为字符串处理
-            lines = [str(time_period_value).strip()]
-
-        for line in lines:
-            self._parse_time_period_line(line)
-
-    def _parse_time_period_line(self, line):
-        """解析单行时间段限制配置"""
-        # 解析时间范围部分
-        time_range_data = self._parse_time_range_from_line(line)
-        if not time_range_data:
-            return
-
-        # 解析限制次数
-        limit_data = self._parse_limit_from_line(line)
-        if not limit_data:
-            return
-
-        # 解析启用标志
-        enabled = self._parse_enabled_flag_from_line(line)
-
-        # 如果启用，则添加到限制列表
-        if enabled:
-            self.time_period_limits.append(
-                {
-                    "start_time": time_range_data["start_time"],
-                    "end_time": time_range_data["end_time"],
-                    "limit": limit_data,
-                }
-            )
-
-    def _parse_time_range_from_line(self, line):
-        """从配置行中解析时间范围"""
-        parts = self._validate_config_line(line, ":", 2)
-        if not parts:
-            return None
-
-        time_range = parts[0].strip()
-        time_parts = self._validate_config_line(time_range, "-", 2)
-        if not time_parts:
-            return None
-
-        start_time = time_parts[0].strip()
-        end_time = time_parts[1].strip()
-
-        # 验证时间格式
-        if not self._validate_time_format(start_time) or not self._validate_time_format(
-            end_time
-        ):
-            self._log_warning("时间段限制时间格式错误: {}", line)
-            return None
-
-        return {"start_time": start_time, "end_time": end_time}
-
-    def _parse_limit_from_line(self, line):
-        """从配置行中解析限制次数"""
-        parts = self._validate_config_line(line, ":", 2)
-        if not parts:
-            return None
-
-        limit = self._safe_parse_int(parts[1].strip())
-        if limit is not None:
-            return limit
-        else:
-            self._log_warning("时间段限制次数格式错误: {}", line)
-            return None
-
-    def _parse_enabled_flag_from_line(self, line):
-        """从配置行中解析启用标志"""
-        line = line.strip()
-        parts = line.split(":", 2)
-
-        if len(parts) >= 3:
-            return self._parse_enabled_flag(parts[2])
-        return True
-
-    def _validate_time_format(self, time_str):
-        """验证时间格式"""
-        try:
-            datetime.datetime.strptime(time_str, "%H:%M")
-            return True
-        except ValueError:
-            return False
-
-    def _parse_enabled_flag(self, enabled_str):
-        """解析启用标志"""
-        if enabled_str is None:
-            return True
-
-        enabled_str = enabled_str.strip().lower()
-        return enabled_str in ["true", "1", "yes", "y"]
 
     def _load_skip_patterns(self):
         """加载忽略模式配置"""
@@ -1471,7 +1370,7 @@ class DailyLimitPlugin(star.Star):
             # 如果没有指定时间段ID，使用当前时间段
             current_time_str = datetime.datetime.now().strftime("%H:%M")
             for i, time_limit in enumerate(self.time_period_limits):
-                if self._is_in_time_period(
+                if self.time_period_mgr.is_in_time_period(
                     current_time_str, time_limit["start_time"], time_limit["end_time"]
                 ):
                     time_period_id = i
@@ -1496,7 +1395,7 @@ class DailyLimitPlugin(star.Star):
         if not self.redis:
             return 0
 
-        key = self._get_time_period_usage_key(user_id, group_id)
+        key = self.time_period_mgr.get_time_period_usage_key(user_id, group_id)
         if key is None:
             return 0
 
@@ -1512,7 +1411,7 @@ class DailyLimitPlugin(star.Star):
         if not self.redis:
             return False
 
-        key = self._get_time_period_usage_key(user_id, group_id)
+        key = self.time_period_mgr.get_time_period_usage_key(user_id, group_id)
         if key is None:
             return False
 
@@ -1540,7 +1439,7 @@ class DailyLimitPlugin(star.Star):
             return float("inf")  # 无限制
 
         # 检查时间段限制（优先级第二）
-        time_period_limit = self._get_current_time_period_limit()
+        time_period_limit = self.time_period_mgr.get_current_time_period_limit()
         if time_period_limit is not None:
             return time_period_limit
 
@@ -1570,10 +1469,10 @@ class DailyLimitPlugin(star.Star):
 
         try:
             # 检查时间段限制（优先级最高）
-            time_period_limit = self._get_current_time_period_limit()
+            time_period_limit = self.time_period_mgr.get_current_time_period_limit()
             if time_period_limit is not None:
                 # 有时间段限制时，使用时间段内的使用次数
-                return self._get_time_period_usage(user_id, group_id)
+                return self.time_period_mgr.get_time_period_usage(user_id, group_id)
 
             # 没有时间段限制时，使用日使用次数
             if user_id is None:
@@ -1604,7 +1503,7 @@ class DailyLimitPlugin(star.Star):
 
         try:
             # 检查时间段限制（优先级最高）
-            time_period_limit = self._get_current_time_period_limit()
+            time_period_limit = self.time_period_mgr.get_current_time_period_limit()
             if time_period_limit is not None:
                 # 有时间段限制时，增加时间段使用次数
                 if self._increment_time_period_usage(user_id, group_id):
@@ -1857,91 +1756,6 @@ class DailyLimitPlugin(star.Star):
         except Exception as e:
             self._log_error("解析趋势统计数据失败: {}", str(e))
             return None
-
-    def _extract_trend_metrics(self, trend_data):
-        """从趋势数据中提取关键指标
-
-        参数：
-            trend_data: 趋势数据字典
-
-        返回：
-            tuple: (total_requests, active_users, active_groups, dates)
-        """
-        total_requests = []
-        active_users = []
-        active_groups = []
-        dates = list(trend_data.keys())
-
-        for date in dates:
-            data = trend_data[date]
-            total_requests.append(data.get("total_requests", 0))
-            active_users.append(data.get("active_users", 0))
-            active_groups.append(data.get("active_groups", 0))
-
-        return total_requests, active_users, active_groups, dates
-
-    def _generate_summary_section(self, total_requests, active_users, active_groups):
-        """生成趋势报告摘要部分
-
-        参数：
-            total_requests: 总请求数列表
-            active_users: 活跃用户数列表
-            active_groups: 活跃群组数列表
-
-        返回：
-            str: 摘要部分文本
-        """
-        summary = "📈 使用趋势分析报告\n"
-        summary += "═══════════════\n\n"
-
-        summary += f"📊 总请求数趋势: {total_requests[-1]} 次\n"
-        summary += f"👤 活跃用户数: {active_users[-1]} 人\n"
-        summary += f"👥 活跃群组数: {active_groups[-1]} 个\n\n"
-
-        return summary
-
-    def _generate_detailed_section(self, trend_data, dates):
-        """生成详细趋势数据部分
-
-        参数：
-            trend_data: 趋势数据字典
-            dates: 日期列表
-
-        返回：
-            str: 详细数据部分文本
-        """
-        detailed = "📅 详细趋势数据:\n"
-        for i, date in enumerate(dates):
-            data = trend_data[date]
-            detailed += f"• {date}: {data.get('total_requests', 0)} 次请求, {data.get('active_users', 0)} 活跃用户\n"
-
-        return detailed
-
-    def _analyze_trends(self, trend_data):
-        """分析趋势数据，生成趋势报告"""
-        if not trend_data:
-            return "暂无趋势数据"
-
-        try:
-            # 提取关键指标
-            total_requests, active_users, active_groups, dates = (
-                self._extract_trend_metrics(trend_data)
-            )
-
-            # 生成报告各部分
-            summary = self._generate_summary_section(
-                total_requests, active_users, active_groups
-            )
-            detailed = self._generate_detailed_section(trend_data, dates)
-
-            # 组合完整报告
-            trend_report = summary + detailed
-
-            return trend_report
-
-        except Exception as e:
-            self._log_error("分析趋势数据失败: {}", str(e))
-            return "趋势分析失败，请稍后重试"
 
     def _set_expiry_for_stats_keys(self, keys_to_update):
         """为统计键设置过期时间"""
@@ -2317,7 +2131,7 @@ class DailyLimitPlugin(star.Star):
 
         # 检查使用状态
         limit = self._get_user_limit(user_id, group_id)
-        time_period_limit = self._get_current_time_period_limit()
+        time_period_limit = self.time_period_mgr.get_current_time_period_limit()
         current_time_str = datetime.datetime.now().strftime("%H:%M")
 
         # 首先检查用户是否被豁免（优先级最高）
@@ -2835,194 +2649,9 @@ class DailyLimitPlugin(star.Star):
                 )
             )
 
-    @filter.permission_type(PermissionType.ADMIN)
-    @limit_command_group.command("help")
-    async def _build_basic_management_help(self, event: AstrMessageEvent):
-        """构建基础管理命令帮助信息"""
-        help_text = (
-            "📋 基础管理命令：\n"
-            "├── /limit help - 显示此帮助信息\n"
-            "├── /limit set <用户ID> <次数> - 设置特定用户的每日限制次数\n"
-            "│   示例：/limit set 123456 50 - 设置用户123456的每日限制为50次\n"
-            "├── /limit setgroup <次数> - 设置当前群组的每日限制次数\n"
-            "│   示例：/limit setgroup 30 - 设置当前群组的每日限制为30次\n"
-            "├── /limit setmode <shared|individual> - 设置当前群组使用模式\n"
-            "│   示例：/limit setmode shared - 设置为共享模式\n"
-            "├── /limit getmode - 查看当前群组使用模式\n"
-            "├── /limit exempt <用户ID> - 将用户添加到豁免列表（不受限制）\n"
-            "│   示例：/limit exempt 123456 - 豁免用户123456\n"
-            "├── /limit unexempt <用户ID> - 将用户从豁免列表移除\n"
-            "│   示例：/limit unexempt 123456 - 取消用户123456的豁免\n"
-            "├── /limit list_user - 列出所有用户特定限制\n"
-            "└── /limit list_group - 列出所有群组特定限制\n"
-        )
-        event.set_result(MessageEventResult().message(help_text))
-
-    def _build_time_period_help(self) -> str:
-        """构建时间段限制命令帮助信息"""
-        return (
-            "\n⏰ 时间段限制命令：\n"
-            "├── /limit timeperiod list - 列出所有时间段限制配置\n"
-            "├── /limit timeperiod add <开始时间> <结束时间> <限制次数> - 添加时间段限制\n"
-            "│   示例：/limit timeperiod add 09:00 18:00 10 - 添加9:00-18:00时间段限制10次\n"
-            "├── /limit timeperiod remove <索引> - 删除时间段限制\n"
-            "│   示例：/limit timeperiod remove 1 - 删除第1个时间段限制\n"
-            "├── /limit timeperiod enable <索引> - 启用时间段限制\n"
-            "│   示例：/limit timeperiod enable 1 - 启用第1个时间段限制\n"
-            "└── /limit timeperiod disable <索引> - 禁用时间段限制\n"
-            "    示例：/limit timeperiod disable 1 - 禁用第1个时间段限制\n"
-        )
-
-    def _build_reset_time_help(self) -> str:
-        """构建重置时间管理命令帮助信息"""
-        return (
-            "\n🕐 重置时间管理命令：\n"
-            "├── /limit resettime get - 查看当前重置时间\n"
-            "├── /limit resettime set <时间> - 设置每日重置时间\n"
-            "│   示例：/limit resettime set 06:00 - 设置为早上6点重置\n"
-            "└── /limit resettime reset - 重置为默认时间（00:00）\n"
-        )
-
-    def _build_skip_patterns_help(self) -> str:
-        """构建忽略模式管理命令帮助信息"""
-        return (
-            "\n🔧 忽略模式管理命令：\n"
-            "├── /limit skip_patterns list - 查看当前忽略模式\n"
-            "├── /limit skip_patterns add <模式> - 添加忽略模式\n"
-            "│   示例：/limit skip_patterns add ! - 添加!为忽略模式\n"
-            "├── /limit skip_patterns remove <模式> - 移除忽略模式\n"
-            "│   示例：/limit skip_patterns remove # - 移除#忽略模式\n"
-            "└── /limit skip_patterns reset - 重置为默认模式\n"
-            "    示例：/limit skip_patterns reset - 重置为默认模式[@所有人, #]\n"
-        )
-
-    def _build_query_stats_help(self) -> str:
-        """构建查询统计命令帮助信息"""
-        return (
-            "\n📊 查询统计命令：\n"
-            "├── /limit stats - 查看今日使用统计信息\n"
-            "├── /limit history [用户ID] [天数] - 查询使用历史记录\n"
-            "│   示例：/limit history 123456 7 - 查询用户123456最近7天的使用记录\n"
-            "├── /limit trends [周期] - 使用趋势分析（日/周/月）\n"
-            "│   示例：/limit trends week - 查看最近4周的使用趋势\n"
-            "├── /limit analytics [日期] - 多维度统计分析\n"
-            "│   示例：/limit analytics 2025-01-23 - 分析2025年1月23日的使用数据\n"
-            "├── /limit top [数量] - 查看使用次数排行榜\n"
-            "│   示例：/limit top 10 - 查看今日使用次数前10名\n"
-            "├── /limit status - 检查插件状态和健康状态\n"
-            "└── /limit domain - 查看Web管理界面域名配置和访问地址\n"
-        )
-
-    def _build_reset_commands_help(self) -> str:
-        """构建重置命令帮助信息"""
-        return (
-            "\n🔄 重置命令：\n"
-            "├── /limit reset all - 重置所有使用记录（包括个人和群组）\n"
-            "├── /limit reset <用户ID> - 重置特定用户的使用次数\n"
-            "│   示例：/limit reset 123456 - 重置用户123456的使用次数\n"
-            "└── /limit reset group <群组ID> - 重置特定群组的使用次数\n"
-            "    示例：/limit reset group 789012 - 重置群组789012的使用次数\n"
-        )
-
-    def _build_security_commands_help(self) -> str:
-        """构建安全命令帮助信息"""
-        return (
-            "\n🛡️ 安全命令：\n"
-            "├── /limit security status - 查看防刷机制状态和统计信息\n"
-            "├── /limit security enable - 启用防刷机制\n"
-            "├── /limit security disable - 禁用防刷机制\n"
-            "├── /limit security config - 查看当前安全配置\n"
-            "├── /limit security blocklist - 查看当前被限制的用户列表\n"
-            "├── /limit security unblock <用户ID> - 解除对用户的限制\n"
-            "│   示例：/limit security unblock 123456 - 解除用户123456的限制\n"
-            "└── /limit security stats <用户ID> - 查看用户的异常行为统计\n"
-            "    示例：/limit security stats 123456 - 查看用户123456的异常行为统计\n"
-        )
-
-    def _build_version_check_help(self) -> str:
-        """构建版本检查命令帮助信息"""
-        return (
-            "\n🔍 版本检查命令：\n"
-            "├── /limit checkupdate - 手动检查版本更新\n"
-            "│   示例：/limit checkupdate - 立即检查是否有新版本\n"
-            "└── /limit version - 查看当前插件版本信息\n"
-            "    示例：/limit version - 显示当前版本和检查状态\n"
-        )
-
-    def _build_priority_rules_help(self) -> str:
-        """构建优先级规则帮助信息"""
-        return (
-            "\n🎯 优先级规则（从高到低）：\n"
-            "1️⃣ ⏰ 时间段限制 - 优先级最高（特定时间段内的限制）\n"
-            "2️⃣ 🏆 豁免用户 - 完全不受限制（白名单用户）\n"
-            "3️⃣ 👤 用户特定限制 - 针对单个用户的个性化设置\n"
-            "4️⃣ 👥 群组特定限制 - 针对整个群组的统一设置\n"
-            "5️⃣ ⚙️ 默认限制 - 全局默认设置（兜底规则）\n"
-        )
-
-    def _build_usage_modes_help(self) -> str:
-        """构建使用模式说明帮助信息"""
-        return (
-            "\n📊 使用模式说明：\n"
-            "• 🔄 共享模式：群组内所有成员共享使用次数（默认模式）\n"
-            "   └── 适合小型团队协作，统一管理使用次数\n"
-            "• 👤 独立模式：群组内每个成员有独立的使用次数\n"
-            "   └── 适合大型团队，成员间互不影响\n"
-        )
-
-    def _build_features_help(self) -> str:
-        """构建功能特性帮助信息"""
-        return (
-            "\n💡 功能特性：\n"
-            "✅ 智能限制系统：多级权限管理，支持用户、群组、豁免用户三级体系\n"
-            "✅ 时间段限制：支持按时间段设置不同的调用限制（优先级最高）\n"
-            "✅ 自定义重置时间：支持设置每日重置时间（默认00:00）\n"
-            "✅ 群组协作模式：支持共享模式（群组共享次数）和独立模式（成员独立次数）\n"
-            "✅ 数据监控分析：实时监控、使用统计、排行榜和状态监控\n"
-            "✅ 使用趋势分析：支持日/周/月多维度使用趋势分析\n"
-            "✅ 使用记录：详细记录每次调用，支持历史查询和统计分析\n"
-            "✅ 自定义忽略模式：可配置需要忽略处理的消息前缀\n"
-            "✅ 智能提醒：剩余次数提醒和使用状态监控\n"
-        )
-
-    def _build_usage_tips_help(self) -> str:
-        """构建使用提示帮助信息"""
-        return (
-            "\n📝 使用提示：\n"
-            "• 所有命令都需要管理员权限才能使用\n"
-            "• 时间段限制优先级最高，会覆盖其他限制规则\n"
-            "• 豁免用户不受任何限制规则约束\n"
-            "• 默认忽略模式：#、*（可自定义添加）\n"
-            "• 重置时间设置后，所有用户和群组的使用次数将在指定时间重置\n"
-        )
-
-    def _build_version_info_help(self) -> str:
-        """构建版本信息帮助信息"""
-        return (
-            "\n📝 版本信息：v2.8.7 | 作者：left666 | 改进：Sakura520222\n"
-            "═════════════════════════"
-        )
-
     async def limit_help(self, event: AstrMessageEvent):
         """显示详细帮助信息（仅管理员）"""
-        help_msg = "🚀 日调用限制插件 v2.8.7 - 管理员详细帮助\n"
-        help_msg += "═════════════════════════\n\n"
-
-        # 组合所有帮助信息
-        help_msg += self._build_basic_management_help()
-        help_msg += self._build_time_period_help()
-        help_msg += self._build_reset_time_help()
-        help_msg += self._build_skip_patterns_help()
-        help_msg += self._build_query_stats_help()
-        help_msg += self._build_reset_commands_help()
-        help_msg += self._build_security_commands_help()
-        help_msg += self._build_version_check_help()
-        help_msg += self._build_priority_rules_help()
-        help_msg += self._build_usage_modes_help()
-        help_msg += self._build_features_help()
-        help_msg += self._build_usage_tips_help()
-        help_msg += self._build_version_info_help()
-
+        help_msg = self.help_manager.build_full_help()
         event.set_result(MessageEventResult().message(help_msg))
 
     @filter.permission_type(PermissionType.ADMIN)
@@ -3573,27 +3202,16 @@ class DailyLimitPlugin(star.Star):
             return
 
         try:
-            # 获取今日所有用户的调用统计
-            today_key = self._get_today_key()
-            pattern = f"{today_key}:*"
-            keys = self.redis.keys(pattern)
-
-            total_calls = 0
-            active_users = 0
-
-            for key in keys:
-                usage = self.redis.get(key)
-                if usage:
-                    total_calls += int(usage)
-                    active_users += 1
+            # 使用 stats_analyzer 获取今日统计摘要
+            stats_data = self.stats_analyzer.get_today_stats_summary()
 
             stats_msg = (
                 f"📊 今日统计信息：\n"
-                f"• 活跃用户数: {active_users}\n"
-                f"• 总调用次数: {total_calls}\n"
-                f"• 用户特定限制数: {len(self.user_limits)}\n"
-                f"• 群组特定限制数: {len(self.group_limits)}\n"
-                f"• 豁免用户数: {len(self.config['limits']['exempt_users'])}"
+                f"• 活跃用户数: {stats_data.get('active_users', 0)}\n"
+                f"• 总调用次数: {stats_data.get('total_calls', 0)}\n"
+                f"• 用户特定限制数: {stats_data.get('user_limits_count', 0)}\n"
+                f"• 群组特定限制数: {stats_data.get('group_limits_count', 0)}\n"
+                f"• 豁免用户数: {stats_data.get('exempt_users_count', 0)}"
             )
 
             event.set_result(MessageEventResult().message(stats_msg))
@@ -3734,7 +3352,7 @@ class DailyLimitPlugin(star.Star):
             period_type = period_mapping.get(period, "daily")
 
             # 获取趋势数据
-            trend_data = self._get_trend_data(period_type)
+            trend_data = self.stats_analyzer.get_trend_data(period_type)
 
             if not trend_data:
                 event.set_result(
@@ -3743,7 +3361,7 @@ class DailyLimitPlugin(star.Star):
                 return
 
             # 分析趋势数据
-            trend_report = self._analyze_trends(trend_data)
+            trend_report = self.stats_analyzer.analyze_trends(trend_data)
 
             # 构建趋势分析消息
             trend_msg = f"📈 {period.capitalize()}使用趋势分析：\n\n"
@@ -3787,7 +3405,7 @@ class DailyLimitPlugin(star.Star):
             period_type = period_mapping.get(period, "weekly")
 
             # 获取趋势数据
-            trend_data = self._get_trend_data(period_type)
+            trend_data = self.stats_analyzer.get_trend_data(period_type)
 
             if not trend_data:
                 event.set_result(

@@ -5,11 +5,14 @@
 """
 
 from .config_manager import ConfigManager
+from .help_manager import HelpManager
 from .limiter import Limiter
 from .logger import Logger
 from .message_builder import MessageBuilder
 from .redis_client import RedisClient
 from .security import Security
+from .stats_analyzer import StatsAnalyzer
+from .time_period_manager import TimePeriodManager
 from .usage_tracker import UsageTracker
 from .version_checker import VersionChecker
 
@@ -22,4 +25,7 @@ __all__ = [
     "UsageTracker",
     "MessageBuilder",
     "VersionChecker",
+    "HelpManager",
+    "StatsAnalyzer",
+    "TimePeriodManager",
 ]
