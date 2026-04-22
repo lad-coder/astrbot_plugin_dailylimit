@@ -142,6 +142,15 @@ class HelpManager:
             "    示例：/limit version - 显示当前版本和检查状态\n"
         )
 
+    def build_newapi_help(self) -> str:
+        """构建 NewAPI 令牌命令帮助信息"""
+        return (
+            "\n🔑 NewAPI 令牌命令：\n"
+            "├── /limit newapi create @用户 - 为被艾特用户创建令牌并发送邮件通知\n"
+            "│   示例：/limit newapi create @张三\n"
+            "└── /limit newapi help - 查看 NewAPI 令牌命令帮助\n"
+        )
+
     def build_priority_rules_help(self) -> str:
         """构建优先级规则帮助信息"""
         return (
@@ -210,6 +219,7 @@ class HelpManager:
         help_msg += self.build_reset_commands_help()
         help_msg += self.build_security_commands_help()
         help_msg += self.build_version_check_help()
+        help_msg += self.build_newapi_help()
         help_msg += self.build_priority_rules_help()
         help_msg += self.build_usage_modes_help()
         help_msg += self.build_features_help()

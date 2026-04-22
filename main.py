@@ -3,8 +3,10 @@ import datetime
 import importlib.util
 import json
 import os
+import smtplib
 import sys
 import time
+from email.message import EmailMessage
 
 import aiohttp
 
@@ -17,6 +19,7 @@ from astrbot.api.event import (  # type: ignore
     filter,
 )
 from astrbot.api.event.filter import PermissionType  # type: ignore
+from astrbot.api.message_components import At  # type: ignore
 from astrbot.api.platform import MessageType  # type: ignore
 from astrbot.api.provider import ProviderRequest  # type: ignore
 
@@ -56,19 +59,23 @@ SecurityHandler = None
 MessagesHandler = None
 _import_error = None
 
+
 def _load_core_module(module_name):
     """从插件的 core 目录加载模块"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     core_dir = os.path.join(current_dir, "core")
     module_path = os.path.join(core_dir, f"{module_name}.py")
 
-    spec = importlib.util.spec_from_file_location(f"astrbot_daily_limit.core.{module_name}", module_path)
+    spec = importlib.util.spec_from_file_location(
+        f"astrbot_daily_limit.core.{module_name}", module_path
+    )
     if spec is None or spec.loader is None:
         raise ImportError(f"无法为 {module_name} 创建模块规范")
     module = importlib.util.module_from_spec(spec)
     sys.modules[f"astrbot_daily_limit.core.{module_name}"] = module
     spec.loader.exec_module(module)
     return module
+
 
 try:
     Logger = _load_core_module("logger").Logger
@@ -127,10 +134,22 @@ class DailyLimitPlugin(star.Star):
 
         # 初始化核心模块（必须最先初始化，因为其他代码依赖日志）
         required_modules = [
-            Logger, RedisClient, ConfigManager, ConfigLoader, Limiter, Security,
-            UsageTracker, MessageBuilder, VersionChecker, HelpManager,
-            StatsAnalyzer, TimePeriodManager, WebManager, RedisKeys,
-            SecurityHandler, MessagesHandler
+            Logger,
+            RedisClient,
+            ConfigManager,
+            ConfigLoader,
+            Limiter,
+            Security,
+            UsageTracker,
+            MessageBuilder,
+            VersionChecker,
+            HelpManager,
+            StatsAnalyzer,
+            TimePeriodManager,
+            WebManager,
+            RedisKeys,
+            SecurityHandler,
+            MessagesHandler,
         ]
         if any(m is None for m in required_modules):
             # 核心模块导入失败，无法继续
@@ -227,7 +246,9 @@ class DailyLimitPlugin(star.Star):
         self, func, *args, context: str = "", default_return=None, **kwargs
     ):
         """安全执行函数，捕获异常并记录"""
-        return self.logger.safe_execute(func, *args, context=context, default_return=default_return, **kwargs)
+        return self.logger.safe_execute(
+            func, *args, context=context, default_return=default_return, **kwargs
+        )
 
     def _validate_redis_connection(self) -> bool:
         """验证Redis连接状态"""
@@ -253,7 +274,9 @@ class DailyLimitPlugin(star.Star):
 
     def _validate_config_line(self, line, required_separator=":", min_parts=2):
         """验证配置行格式（代理方法）"""
-        return self.config_loader.validate_config_line(line, required_separator, min_parts)
+        return self.config_loader.validate_config_line(
+            line, required_separator, min_parts
+        )
 
     def _parse_limit_line(self, line, limits_dict, limit_type):
         """解析单行限制配置（代理方法）"""
@@ -302,6 +325,313 @@ class DailyLimitPlugin(star.Star):
     def _validate_daily_reset_time(self):
         """验证每日重置时间配置（代理方法）"""
         self.config_loader.validate_daily_reset_time()
+
+    def _get_config_section(self, section_name: str) -> dict:
+        """Safely read a config section."""
+        try:
+            section = self.config[section_name]
+        except Exception:
+            return {}
+        return section if isinstance(section, dict) else {}
+
+    def _get_newapi_manager_config(self) -> dict:
+        """获取 NewAPI 令牌管理配置"""
+        return self._get_config_section("newapi_token_manager")
+
+    def _get_mail_config(self) -> dict:
+        """获取邮件通知配置"""
+        return self._get_config_section("mail")
+
+    def _parse_applicant_email_mapping(self) -> dict:
+        """解析申请人邮箱映射配置"""
+        mapping = {}
+        config_text = str(
+            self._get_newapi_manager_config().get("applicant_emails", "") or ""
+        )
+
+        for raw_line in config_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+
+            user_id, email = line.split(":", 1)
+            user_id = user_id.strip()
+            email = email.strip()
+
+            if user_id and email:
+                mapping[user_id] = email
+
+        return mapping
+
+    def _extract_mentioned_user_ids(self, event: AstrMessageEvent) -> list:
+        """Extract mentioned user ids from the message chain."""
+        mentioned_user_ids = []
+
+        for component in event.get_messages():
+            if not isinstance(component, At):
+                continue
+
+            qq = str(getattr(component, "qq", "") or "").strip()
+            if not qq or qq == "all" or qq == str(event.get_self_id()):
+                continue
+
+            if qq not in mentioned_user_ids:
+                mentioned_user_ids.append(qq)
+
+        return mentioned_user_ids
+
+    def _build_newapi_command_help(self) -> str:
+        """构建 NewAPI 令牌命令帮助"""
+        return (
+            "🔑 NewAPI 令牌管理命令\n"
+            "══════════════════\n\n"
+            "• /limit newapi create @用户\n"
+            "  为被艾特用户创建 NewAPI 令牌，并按配置中的邮箱映射发送邮件通知。\n\n"
+            "配置要求：\n"
+            "1. 在 newapi_token_manager 中填写 NewAPI 管理接口配置\n"
+            "2. 在 newapi_token_manager.applicant_emails 中维护 用户ID:邮箱 映射\n"
+            "3. 在 mail 中填写 SMTP 发信配置"
+        )
+
+    def _get_newapi_base_url(self) -> str:
+        """获取 NewAPI 管理接口地址"""
+        base_url = str(
+            self._get_newapi_manager_config().get("base_url", "") or ""
+        ).strip()
+        return base_url.rstrip("/")
+
+    def _get_newapi_api_base_url(self) -> str:
+        """获取发给申请人的 API Base URL"""
+        config = self._get_newapi_manager_config()
+        api_base_url = str(config.get("api_base_url", "") or "").strip()
+
+        if api_base_url:
+            return api_base_url.rstrip("/")
+
+        base_url = self._get_newapi_base_url()
+        if not base_url:
+            return ""
+
+        return f"{base_url}/v1"
+
+    def _build_newapi_headers(self) -> dict:
+        """构建 NewAPI 请求头"""
+        config = self._get_newapi_manager_config()
+        base_url = self._get_newapi_base_url()
+        access_token = str(config.get("access_token", "") or "").strip()
+        user_id = str(config.get("user_id", "") or "").strip()
+
+        if not base_url:
+            raise ValueError(
+                "未配置 NewAPI 管理地址，请填写 newapi_token_manager.base_url"
+            )
+        if not access_token:
+            raise ValueError(
+                "未配置 NewAPI 管理访问令牌，请填写 newapi_token_manager.access_token"
+            )
+        if not user_id:
+            raise ValueError(
+                "未配置 NewAPI 用户ID，请填写 newapi_token_manager.user_id"
+            )
+
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "New-Api-User": user_id,
+        }
+
+    @staticmethod
+    def _parse_newapi_error_message(payload, fallback_message: str) -> str:
+        """解析 NewAPI 错误消息"""
+        if isinstance(payload, dict):
+            message = payload.get("message")
+            if message:
+                return str(message)
+        return fallback_message
+
+    async def _request_newapi(
+        self, method: str, path: str, payload: dict = None
+    ) -> dict:
+        """调用 NewAPI 管理接口"""
+        url = f"{self._get_newapi_base_url()}{path}"
+        headers = self._build_newapi_headers()
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=payload,
+            ) as response:
+                response_text = await response.text()
+
+        try:
+            data = json.loads(response_text) if response_text else {}
+        except json.JSONDecodeError:
+            data = {"message": response_text}
+
+        if response.status >= 400:
+            message = self._parse_newapi_error_message(
+                data, f"NewAPI 请求失败（HTTP {response.status}）"
+            )
+            raise RuntimeError(message)
+
+        if isinstance(data, dict) and data.get("success") is False:
+            raise RuntimeError(
+                self._parse_newapi_error_message(data, "NewAPI 返回失败")
+            )
+
+        return data if isinstance(data, dict) else {}
+
+    def _build_newapi_token_name(self, applicant_user_id: str) -> str:
+        """生成令牌名称"""
+        config = self._get_newapi_manager_config()
+        prefix = str(config.get("token_name_prefix", "") or "").strip()
+        if not prefix:
+            prefix = "astrbot-applicant"
+
+        timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        return f"{prefix}-{applicant_user_id}-{timestamp}"
+
+    def _build_newapi_create_payload(self, applicant_user_id: str) -> tuple:
+        """构建创建令牌请求体"""
+        config = self._get_newapi_manager_config()
+        token_name = self._build_newapi_token_name(applicant_user_id)
+        payload = {
+            "name": token_name,
+            "unlimited_quota": True,
+        }
+
+        default_group = str(config.get("default_group", "") or "").strip()
+        if default_group:
+            payload["group"] = default_group
+
+        quota_text = str(config.get("default_quota_usd", "") or "").strip()
+        if quota_text:
+            quota_raw = int(float(quota_text) * 500000)
+            if quota_raw < 0:
+                raise ValueError("default_quota_usd 不能为负数")
+            payload["remain_quota"] = quota_raw
+            payload["unlimited_quota"] = False
+
+        return token_name, payload
+
+    async def _fetch_newapi_token_key(self, token_id: str) -> str:
+        """获取新创建令牌的完整 key"""
+        data = await self._request_newapi("POST", f"/api/token/{token_id}/key")
+        key_data = data.get("data", {}) if isinstance(data, dict) else {}
+        raw_key = str(key_data.get("key", "") or "").strip()
+
+        if not raw_key:
+            raise RuntimeError("NewAPI 未返回令牌密钥")
+
+        if raw_key.startswith("sk-"):
+            return raw_key
+        return f"sk-{raw_key}"
+
+    async def _create_newapi_token(self, applicant_user_id: str) -> tuple:
+        """创建令牌并获取完整 key"""
+        token_name, payload = self._build_newapi_create_payload(applicant_user_id)
+        data = await self._request_newapi("POST", "/api/token/", payload)
+        token_data = data.get("data", {}) if isinstance(data, dict) else {}
+        token_id = token_data.get("id")
+
+        if token_id is None or str(token_id).strip() == "":
+            raise RuntimeError("NewAPI 创建成功但未返回令牌ID")
+
+        token_id = str(token_id).strip()
+        token_key = await self._fetch_newapi_token_key(token_id)
+        return token_id, token_name, token_key
+
+    @staticmethod
+    def _safe_format_template(template: str, variables: dict) -> str:
+        """Safely format a template without raising on missing keys."""
+
+        class SafeDict(dict):
+            def __missing__(self, key):
+                return "{" + key + "}"
+
+        return str(template).format_map(SafeDict(variables))
+
+    async def _send_newapi_token_email(
+        self,
+        applicant_user_id: str,
+        applicant_email: str,
+        token_id: str,
+        token_name: str,
+        token_key: str,
+    ) -> None:
+        """发送令牌邮件通知"""
+        mail_config = self._get_mail_config()
+        smtp_host = str(mail_config.get("smtp_host", "") or "").strip()
+        smtp_port = int(mail_config.get("smtp_port", 465) or 465)
+        smtp_username = str(mail_config.get("smtp_username", "") or "").strip()
+        smtp_password = str(mail_config.get("smtp_password", "") or "").strip()
+        from_email = (
+            str(mail_config.get("from_email", "") or "").strip() or smtp_username
+        )
+        use_ssl = bool(mail_config.get("use_ssl", True))
+        use_tls = bool(mail_config.get("use_tls", False))
+
+        if not smtp_host:
+            raise ValueError("未配置 SMTP 主机，请填写 mail.smtp_host")
+        if not from_email:
+            raise ValueError("未配置发件人邮箱，请填写 mail.from_email")
+        if smtp_username and not smtp_password:
+            raise ValueError("已配置 SMTP 用户名，但缺少 mail.smtp_password")
+
+        subject_template = str(
+            mail_config.get("subject_template", "") or "您的 NewAPI 令牌已创建"
+        )
+        body_template = str(
+            mail_config.get("body_template", "")
+            or (
+                "您好，您的 NewAPI 令牌已创建成功。\n\n"
+                "用户ID：{applicant_user_id}\n"
+                "令牌名称：{token_name}\n"
+                "令牌ID：{token_id}\n"
+                "令牌：{token}\n"
+                "API Base URL：{api_base_url}\n\n"
+                "请妥善保管此令牌，避免泄露。"
+            )
+        )
+
+        template_vars = {
+            "applicant_user_id": applicant_user_id,
+            "applicant_email": applicant_email,
+            "token_id": token_id,
+            "token_name": token_name,
+            "token": token_key,
+            "base_url": self._get_newapi_base_url(),
+            "api_base_url": self._get_newapi_api_base_url(),
+            "current_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+
+        subject = self._safe_format_template(subject_template, template_vars)
+        body = self._safe_format_template(body_template, template_vars)
+
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = from_email
+        message["To"] = applicant_email
+        message.set_content(body)
+
+        def _send_mail():
+            if use_ssl:
+                smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
+            else:
+                smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+
+            try:
+                if use_tls and not use_ssl:
+                    smtp.starttls()
+                if smtp_username:
+                    smtp.login(smtp_username, smtp_password)
+                smtp.send_message(message)
+            finally:
+                smtp.quit()
+
+        await asyncio.to_thread(_send_mail)
 
     def _detect_abuse_behavior(self, user_id, timestamp=None):
         """检测异常使用行为
@@ -787,6 +1117,7 @@ class DailyLimitPlugin(star.Star):
     def _create_web_server_instance(self):
         """创建Web服务器实例（代理方法）"""
         from web_server import WebServer as _WebServer
+
         web_config = self.config.get("web_server", {})
         host = web_config.get("host", "127.0.0.1")
         port = web_config.get("port", 10245)
@@ -1031,7 +1362,9 @@ class DailyLimitPlugin(star.Star):
 
     def _is_in_time_period(self, current_time_str, start_time_str, end_time_str):
         """检查当前时间是否在指定时间段内"""
-        return self.limiter.is_in_time_period(current_time_str, start_time_str, end_time_str)
+        return self.limiter.is_in_time_period(
+            current_time_str, start_time_str, end_time_str
+        )
 
     def _get_current_time_period_limit(self):
         """获取当前时间段适用的限制"""
@@ -1040,7 +1373,9 @@ class DailyLimitPlugin(star.Star):
     def _get_time_period_usage_key(self, user_id, group_id=None, time_period_id=None):
         """获取时间段使用次数的Redis键"""
         if self.limiter:
-            return self.limiter.get_time_period_usage_key(user_id, group_id, time_period_id)
+            return self.limiter.get_time_period_usage_key(
+                user_id, group_id, time_period_id
+            )
 
         # 使用内置实现（兼容旧代码）
         if time_period_id is None:
@@ -2146,6 +2481,97 @@ class DailyLimitPlugin(star.Star):
         """显示详细帮助信息（仅管理员）"""
         help_msg = self.help_manager.build_full_help()
         event.set_result(MessageEventResult().message(help_msg))
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @limit_command_group.command("newapi")
+    async def limit_newapi(self, event: AstrMessageEvent):
+        """管理申请人的 NewAPI 令牌（仅管理员）"""
+        args = event.message_str.strip().split()
+
+        if len(args) < 3:
+            event.set_result(
+                MessageEventResult().message(self._build_newapi_command_help())
+            )
+            return
+
+        action = args[2]
+
+        if action == "help":
+            event.set_result(
+                MessageEventResult().message(self._build_newapi_command_help())
+            )
+            return
+
+        if action != "create":
+            event.set_result(
+                MessageEventResult().message(
+                    "❌ 无效的 NewAPI 命令，请使用 /limit newapi help 查看帮助"
+                )
+            )
+            return
+
+        mentioned_user_ids = self._extract_mentioned_user_ids(event)
+        if not mentioned_user_ids:
+            event.set_result(
+                MessageEventResult().message(
+                    "❌ 请在命令中艾特申请人，例如：/limit newapi create @用户"
+                )
+            )
+            return
+
+        if len(mentioned_user_ids) > 1:
+            event.set_result(
+                MessageEventResult().message("❌ 一次只能为一个被艾特用户创建令牌")
+            )
+            return
+
+        applicant_user_id = mentioned_user_ids[0]
+        applicant_email = self._parse_applicant_email_mapping().get(applicant_user_id)
+
+        if not applicant_email:
+            event.set_result(
+                MessageEventResult().message(
+                    f"❌ 未在邮箱映射中找到用户 {applicant_user_id} 的邮箱，请先在配置项 applicant_emails 中维护映射"
+                )
+            )
+            return
+
+        try:
+            token_id, token_name, token_key = await self._create_newapi_token(
+                applicant_user_id
+            )
+        except Exception as e:
+            self._log_error(
+                "创建 NewAPI 令牌失败 - 用户 {}: {}", applicant_user_id, str(e)
+            )
+            event.set_result(
+                MessageEventResult().message(f"❌ 创建 NewAPI 令牌失败：{str(e)}")
+            )
+            return
+
+        try:
+            await self._send_newapi_token_email(
+                applicant_user_id=applicant_user_id,
+                applicant_email=applicant_email,
+                token_id=token_id,
+                token_name=token_name,
+                token_key=token_key,
+            )
+        except Exception as e:
+            self._log_error("令牌邮件发送失败 - 用户 {}: {}", applicant_user_id, str(e))
+            event.set_result(
+                MessageEventResult().message(
+                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），但邮件发送失败：{str(e)}"
+                )
+            )
+            return
+
+        event.set_result(
+            MessageEventResult().message(
+                f"✅ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），并已发送邮件到 {applicant_email}"
+            )
+        )
+
     @limit_command_group.command("set")
     async def limit_set(
         self, event: AstrMessageEvent, user_id: str = None, limit: int = None
@@ -2868,7 +3294,7 @@ class DailyLimitPlugin(star.Star):
                 try:
                     self.redis.ping()
                     redis_available = True
-                except:
+                except Exception:
                     redis_available = False
 
             redis_available_status = "✅ 可用" if redis_available else "❌ 不可用"
@@ -2897,7 +3323,7 @@ class DailyLimitPlugin(star.Star):
                             active_users += 1
 
                     today_stats = f"活跃用户: {active_users}, 总调用: {total_calls}"
-                except:
+                except Exception:
                     today_stats = "获取失败"
 
             # 构建状态报告
@@ -3482,12 +3908,16 @@ class DailyLimitPlugin(star.Star):
             current_version = self.config.get("version", "v2.8.9")
             if self.version_checker.last_checked_version:
                 if (
-                    self.version_checker._compare_versions(self.version_checker.last_checked_version, current_version)
+                    self.version_checker._compare_versions(
+                        self.version_checker.last_checked_version, current_version
+                    )
                     > 0
                 ):
                     # 有新版本
                     update_content = (
-                        self.version_checker.last_checked_version_info.get("content", "暂无更新说明")
+                        self.version_checker.last_checked_version_info.get(
+                            "content", "暂无更新说明"
+                        )
                         if hasattr(self.version_checker, "last_checked_version_info")
                         else "暂无更新说明"
                     )
@@ -3569,16 +3999,15 @@ class DailyLimitPlugin(star.Star):
     ASCII_ART = """
  ██████████     █████████   █████ █████       █████ █████    █████       █████ ██████   ██████ █████ ███████████
 ░░███░░░░███   ███░░░░░███ ░░███ ░░███       ░░███ ░░███    ░░███       ░░███ ░░██████ ██████ ░░███ ░█░░░███░░░█
- ░███   ░░███ ░███    ░███  ░███  ░███        ░░███ ███      ░███        ░███  ░███░█████░███  ░███ ░   ░███  ░ 
- ░███    ░███ ░███████████  ░███  ░███         ░░█████       ░███        ░███  ░███░░███ ░███  ░███     ░███    
- ░███    ░███ ░███░░░░░███  ░███  ░███          ░░███        ░███        ░███  ░███ ░░░  ░███  ░███     ░███    
- ░███    ███  ░███    ░███  ░███  ░███      █    ░███        ░███      █ ░███  ░███      ░███  ░███     ░███    
- ██████████   █████   █████ █████ ███████████    █████       ███████████ █████ █████     █████ █████    █████   
-░░░░░░░░░░   ░░░░░   ░░░░░ ░░░░░ ░░░░░░░░░░░    ░░░░░       ░░░░░░░░░░░ ░░░░░ ░░░░░     ░░░░░ ░░░░░    ░░░░░    
-                                                                                                                
-                                                                                                                                                                                                      
-                                       每日调用限制插件 v2.8.9                       
-                                  作者: left666 & Sakura520222                  
+ ░███   ░░███ ░███    ░███  ░███  ░███        ░░███ ███      ░███        ░███  ░███░█████░███  ░███ ░   ░███  ░
+ ░███    ░███ ░███████████  ░███  ░███         ░░█████       ░███        ░███  ░███░░███ ░███  ░███     ░███
+ ░███    ░███ ░███░░░░░███  ░███  ░███          ░░███        ░███        ░███  ░███ ░░░  ░███  ░███     ░███
+ ░███    ███  ░███    ░███  ░███  ░███      █    ░███        ░███      █ ░███  ░███      ░███  ░███     ░███
+ ██████████   █████   █████ █████ ███████████    █████       ███████████ █████ █████     █████ █████    █████
+░░░░░░░░░░   ░░░░░   ░░░░░ ░░░░░ ░░░░░░░░░░░    ░░░░░       ░░░░░░░░░░░ ░░░░░ ░░░░░     ░░░░░ ░░░░░    ░░░░░
+
+                                       每日调用限制插件 v2.8.9
+                                  作者: left666 & Sakura520222
     """
 
     @filter.on_astrbot_loaded()
