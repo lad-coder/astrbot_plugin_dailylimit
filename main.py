@@ -10,6 +10,7 @@ from email.message import EmailMessage
 from urllib.parse import quote
 
 import aiohttp
+import httpx
 
 import astrbot.api.star as star  # type: ignore
 from astrbot.api import AstrBotConfig  # type: ignore
@@ -26,6 +27,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest  # type: ignore
 
 # Web服务器导入
 WebServer = None
+
 try:
     # 添加当前目录到Python路径
     import os
@@ -132,7 +134,6 @@ class DailyLimitPlugin(star.Star):
         self.blocked_users = {}  # 被限制的用户 {"user_id": "block_until_timestamp"}
         self.abuse_stats = {}  # 异常统计 {"user_id": {"total_abuse_count": count, "last_abuse_time": timestamp}}
         self.zero_usage_notified_users = {}  # 零使用次数提醒记录 {"user_id": last_notified_timestamp}
-        self.newapi_token_key_cache = {}  # {"token_id": "sk-xxx"}
         self.provider_key_switch_lock = asyncio.Lock()
 
         # 初始化核心模块（必须最先初始化，因为其他代码依赖日志）
@@ -568,48 +569,88 @@ class DailyLimitPlugin(star.Star):
             return exact_matches[0]
         return None
 
-    async def _get_newapi_token_detail(self, token_id: str) -> dict:
-        """获取令牌详情"""
-        data = await self._request_newapi("GET", f"/api/token/{token_id}")
-        token_data = data.get("data", {}) if isinstance(data, dict) else {}
-        if not isinstance(token_data, dict) or not token_data:
-            raise RuntimeError("未获取到令牌详情")
-        return token_data
+    async def _get_newapi_token_detail_by_key(self, token_key: str) -> dict:
+        """通过 key 的特征（如名称或搜索）找到对应的令牌详情"""
+        # 由于我们只保存了 key，需要通过 key 去搜索 id
+        # NewAPI 可以通过 keyword 搜索 token
+        # 通常 key 的前缀或中间部分可以作为 keyword
+        search_key = token_key.replace("sk-", "")
 
-    async def _resolve_created_token_id(self, data: dict, token_name: str) -> str:
-        """解析创建后返回的令牌 ID"""
-        token_data = data.get("data", {}) if isinstance(data, dict) else {}
-        token_id = token_data.get("id") if isinstance(token_data, dict) else None
+        # 截取一部分作为 keyword 搜索，避免太长搜不到
+        keyword = search_key[:12] if len(search_key) > 12 else search_key
 
-        if token_id is not None and str(token_id).strip():
-            return str(token_id).strip()
+        data = await self._request_newapi(
+            "GET", f"/api/token/?keyword={quote(keyword)}"
+        )
+        token_list = data.get("data", []) if isinstance(data, dict) else []
+        if not isinstance(token_list, list):
+            raise RuntimeError("未找到对应令牌")
 
-        # NewAPI 可能有写入延迟，尝试轮询查询几次
-        for _ in range(3):
-            await asyncio.sleep(0.5)
-            searched_token = await self._search_newapi_token_by_name(token_name)
-            if searched_token and searched_token.get("id") is not None:
-                return str(searched_token["id"]).strip()
+        for token in token_list:
+            # 找到对应 key
+            if (
+                isinstance(token, dict)
+                and str(token.get("key", "")).strip() == search_key
+            ):
+                return token
 
-        raise RuntimeError("NewAPI 创建成功但未返回令牌ID，且通过名称未能查到新令牌。")
+        raise RuntimeError("未找到对应令牌（可能是 key 已失效或搜索不匹配）")
 
-    async def _update_newapi_token(self, token_id: str, overrides: dict) -> dict:
-        """更新令牌配置"""
-        token_data = await self._get_newapi_token_detail(token_id)
+    async def _get_token_quota_info_by_key(self, token_key: str) -> dict:
+        """通过大模型订阅接口获取令牌真实额度"""
+        config = self._get_newapi_manager_config()
+        base_url = str(config.get("base_url", "") or "").strip().rstrip("/")
+
+        # 直接使用用户 key 请求
+        url = f"{base_url}/v1/dashboard/billing/subscription"
+        headers = {"Authorization": f"Bearer {token_key}"}
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=headers, timeout=10.0)
+                resp.raise_for_status()
+                data = resp.json()
+
+                # NewAPI / OneAPI 会返回类似 {"hard_limit_usd": 10.0, "has_payment_method": ...}
+                return data
+        except Exception as e:
+            self._log_error(f"获取令牌真实额度失败: {str(e)}")
+            return {}
+
+    def _token_has_available_quota_by_key(self, subscription_data: dict) -> bool:
+        """检查令牌订阅数据是否还有可用额度"""
+        # 一般 hard_limit_usd - 消耗 的余额 > 0 就是还有额度，
+        # 或者如果有无限额度的标志
+        if not subscription_data:
+            return False
+
+        hard_limit = float(subscription_data.get("hard_limit_usd", 0) or 0)
+        if hard_limit <= 0:
+            return False
+
+        # 考虑到不同魔改版可能字段不同，暂时只判断 hard_limit_usd 是否大于 0
+        return True
+
+    async def _update_newapi_token_by_key(
+        self, token_key: str, overrides: dict
+    ) -> dict:
+        """更新令牌配置（通过 key 查找后更新）"""
+        token_data = await self._get_newapi_token_detail_by_key(token_key)
+
         payload = self._build_newapi_update_payload(token_data, overrides)
         await self._request_newapi("PUT", "/api/token/", payload)
-        return await self._get_newapi_token_detail(token_id)
+        return await self._get_newapi_token_detail_by_key(token_key)
 
-    def _save_user_token_binding(self, user_id: str, token_id: str) -> None:
-        """保存用户与令牌绑定"""
+    def _save_user_token_binding(self, user_id: str, token_key: str) -> None:
+        """保存用户与令牌绑定（直接保存密钥）"""
         bindings = self._parse_user_token_bindings()
-        bindings[str(user_id)] = str(token_id)
+        bindings[str(user_id)] = str(token_key)
         lines = [f"{uid}:{tid}" for uid, tid in sorted(bindings.items())]
         self.config["newapi_token_manager"]["token_bindings"] = "\n".join(lines)
         self.config.save_config()
 
-    def _get_bound_token_id(self, user_id: str) -> str:
-        """获取用户绑定的令牌 ID"""
+    def _get_bound_token_key(self, user_id: str) -> str:
+        """获取用户绑定的令牌密钥"""
         return str(
             self._parse_user_token_bindings().get(str(user_id), "") or ""
         ).strip()
@@ -645,36 +686,30 @@ class DailyLimitPlugin(star.Star):
             return True
         return int(token_data.get("remain_quota", 0) or 0) > 0
 
-    async def _get_cached_newapi_token_key(self, token_id: str) -> str:
-        """优先从缓存获取令牌 key"""
-        token_id = str(token_id)
-        if token_id in self.newapi_token_key_cache:
-            return self.newapi_token_key_cache[token_id]
-
-        token_key = await self._fetch_newapi_token_key(token_id)
-        self.newapi_token_key_cache[token_id] = token_key
-        return token_key
-
-    async def _fetch_newapi_token_key(self, token_id: str) -> str:
-        """获取新创建令牌的完整 key"""
-        data = await self._request_newapi("POST", f"/api/token/{token_id}/key")
-        key_data = data.get("data", {}) if isinstance(data, dict) else {}
-        raw_key = str(key_data.get("key", "") or "").strip()
-
-        if not raw_key:
-            raise RuntimeError("NewAPI 未返回令牌密钥")
-
-        if raw_key.startswith("sk-"):
-            return raw_key
-        return f"sk-{raw_key}"
-
     async def _create_newapi_token(self, applicant_user_id: str) -> tuple:
-        """创建令牌并获取完整 key"""
+        """创建令牌并直接返回完整 key（不查询 ID）"""
         token_name, payload = self._build_newapi_create_payload(applicant_user_id)
         data = await self._request_newapi("POST", "/api/token/", payload)
-        token_id = await self._resolve_created_token_id(data, token_name)
-        token_key = await self._get_cached_newapi_token_key(token_id)
-        return token_id, token_name, token_key
+
+        # 尝试从 data 解析 key
+        token_data = data.get("data")
+        raw_key = ""
+
+        if isinstance(token_data, dict):
+            raw_key = str(token_data.get("key", "") or "").strip()
+        elif isinstance(token_data, str) and token_data.strip():
+            raw_key = token_data.strip()
+
+        if not raw_key:
+            # 如果接口没有直接返回 key，可能是非标准魔改版或异常
+            # 兼容：尝试从返回信息或者其他字段取，或直接抛错
+            raise RuntimeError(
+                "NewAPI 创建成功但未在返回数据中获取到直接的 key。请确认你的 NewAPI 版本是否直接返回密钥。"
+            )
+
+        token_key = raw_key if raw_key.startswith("sk-") else f"sk-{raw_key}"
+        # 返回假 ID 即可，因为后续查询不再依赖 token_id
+        return "unknown", token_name, token_key
 
     @staticmethod
     def _safe_format_template(template: str, variables: dict) -> str:
@@ -772,14 +807,18 @@ class DailyLimitPlugin(star.Star):
         if not user_id:
             return False
 
-        token_id = self._get_bound_token_id(user_id)
-        if not token_id:
+        token_key = self._get_bound_token_key(user_id)
+        if not token_key:
             return False
 
         try:
-            token_data = await self._get_newapi_token_detail(token_id)
-            if not self._token_has_available_quota(token_data):
-                return False
+            # 通过订阅接口查询额度
+            subscription_data = await self._get_token_quota_info_by_key(token_key)
+            if not self._token_has_available_quota_by_key(subscription_data):
+                # 兼容：如果获取订阅数据失败，则退回通过 token 详情获取 remain_quota
+                token_data = await self._get_newapi_token_detail_by_key(token_key)
+                if not self._token_has_available_quota(token_data):
+                    return False
 
             provider = self.context.get_using_provider(event.unified_msg_origin)
             if (
@@ -791,12 +830,11 @@ class DailyLimitPlugin(star.Star):
 
             await self.provider_key_switch_lock.acquire()
             original_key = provider.get_current_key()
-            token_key = await self._get_cached_newapi_token_key(token_id)
             provider.set_key(token_key)
 
             event.set_extra("_dl_provider_key_switched", True)
             event.set_extra("_dl_provider_original_key", original_key)
-            event.set_extra("_dl_provider_token_id", token_id)
+            event.set_extra("_dl_provider_token_key", token_key)
             event.set_extra(
                 "_dl_provider_restore_task",
                 asyncio.create_task(self._force_restore_llm_provider_key(event)),
@@ -833,7 +871,7 @@ class DailyLimitPlugin(star.Star):
                 restore_task.cancel()
             event.set_extra("_dl_provider_key_switched", False)
             event.set_extra("_dl_provider_original_key", "")
-            event.set_extra("_dl_provider_token_id", "")
+            event.set_extra("_dl_provider_token_key", "")
             event.set_extra("_dl_provider_restore_task", None)
             if self.provider_key_switch_lock.locked():
                 self.provider_key_switch_lock.release()
@@ -2759,14 +2797,15 @@ class DailyLimitPlugin(star.Star):
             return
 
         try:
-            self._save_user_token_binding(applicant_user_id, token_id)
+            # 修改为保存 key
+            self._save_user_token_binding(applicant_user_id, token_key)
         except Exception as e:
             self._log_error(
                 "保存用户令牌绑定失败 - 用户 {}: {}", applicant_user_id, str(e)
             )
             event.set_result(
                 MessageEventResult().message(
-                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），但保存绑定失败：{str(e)}"
+                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌，但保存绑定失败：{str(e)}"
                 )
             )
             return
@@ -2783,14 +2822,14 @@ class DailyLimitPlugin(star.Star):
             self._log_error("令牌邮件发送失败 - 用户 {}: {}", applicant_user_id, str(e))
             event.set_result(
                 MessageEventResult().message(
-                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），但邮件发送失败：{str(e)}"
+                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌，但邮件发送失败：{str(e)}"
                 )
             )
             return
 
         event.set_result(
             MessageEventResult().message(
-                f"✅ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），并已发送邮件到 {applicant_email}"
+                f"✅ 已为用户 {applicant_user_id} 创建 NewAPI 令牌，并已发送邮件到 {applicant_email}"
             )
         )
 
