@@ -400,11 +400,11 @@
                 "default": "astrbot-applicant",
                 "hint": "实际令牌名格式为：前缀-用户ID-时间戳"
             },
-            "applicant_emails": {
-                "description": "申请人邮箱映射",
+            "token_bindings": {
+                "description": "用户与令牌绑定",
                 "type": "text",
                 "default": "",
-                "hint": "格式：用户ID:邮箱，一行一个\n示例：\n123456789:user1@example.com\n987654321:user2@example.com"
+                "hint": "格式：用户ID:令牌ID，一行一个。创建令牌成功后会自动维护。\n示例：\n123456789:1001\n987654321:1002"
             }
         }
     },

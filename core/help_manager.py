@@ -143,12 +143,14 @@ class HelpManager:
         )
 
     def build_newapi_help(self) -> str:
-        """构建 NewAPI 令牌命令帮助信息"""
+        """构建西西令牌命令帮助信息"""
         return (
-            "\n🔑 NewAPI 令牌命令：\n"
-            "├── /limit newapi create @用户 - 为被艾特用户创建令牌并发送邮件通知\n"
-            "│   示例：/limit newapi create @张三\n"
-            "└── /limit newapi help - 查看 NewAPI 令牌命令帮助\n"
+            "\n🔑 西西令牌命令：\n"
+            "├── /西西令牌 创建 @用户 - 为被艾特用户创建令牌并发送到 用户ID@qq.com\n"
+            "│   示例：/西西令牌 创建 @张三\n"
+            "├── /西西令牌 充值 @用户 <额度> - 为用户绑定的令牌增加额度\n"
+            "│   示例：/西西令牌 充值 @张三 10\n"
+            "└── /西西令牌 帮助 - 查看西西令牌命令帮助\n"
         )
 
     def build_priority_rules_help(self) -> str:

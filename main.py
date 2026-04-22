@@ -7,6 +7,7 @@ import smtplib
 import sys
 import time
 from email.message import EmailMessage
+from urllib.parse import quote
 
 import aiohttp
 
@@ -21,7 +22,7 @@ from astrbot.api.event import (  # type: ignore
 from astrbot.api.event.filter import PermissionType  # type: ignore
 from astrbot.api.message_components import At  # type: ignore
 from astrbot.api.platform import MessageType  # type: ignore
-from astrbot.api.provider import ProviderRequest  # type: ignore
+from astrbot.api.provider import LLMResponse, ProviderRequest  # type: ignore
 
 # Web服务器导入
 WebServer = None
@@ -131,6 +132,8 @@ class DailyLimitPlugin(star.Star):
         self.blocked_users = {}  # 被限制的用户 {"user_id": "block_until_timestamp"}
         self.abuse_stats = {}  # 异常统计 {"user_id": {"total_abuse_count": count, "last_abuse_time": timestamp}}
         self.zero_usage_notified_users = {}  # 零使用次数提醒记录 {"user_id": last_notified_timestamp}
+        self.newapi_token_key_cache = {}  # {"token_id": "sk-xxx"}
+        self.provider_key_switch_lock = asyncio.Lock()
 
         # 初始化核心模块（必须最先初始化，因为其他代码依赖日志）
         required_modules = [
@@ -342,26 +345,28 @@ class DailyLimitPlugin(star.Star):
         """获取邮件通知配置"""
         return self._get_config_section("mail")
 
-    def _parse_applicant_email_mapping(self) -> dict:
-        """解析申请人邮箱映射配置"""
+    def _parse_simple_mapping_config(self, config_key: str) -> dict:
+        """解析简单的 key:value 文本映射配置"""
         mapping = {}
-        config_text = str(
-            self._get_newapi_manager_config().get("applicant_emails", "") or ""
-        )
+        config_text = str(self._get_newapi_manager_config().get(config_key, "") or "")
 
         for raw_line in config_text.splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or ":" not in line:
                 continue
 
-            user_id, email = line.split(":", 1)
-            user_id = user_id.strip()
-            email = email.strip()
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
 
-            if user_id and email:
-                mapping[user_id] = email
+            if key and value:
+                mapping[key] = value
 
         return mapping
+
+    def _parse_user_token_bindings(self) -> dict:
+        """解析用户与令牌绑定配置"""
+        return self._parse_simple_mapping_config("token_bindings")
 
     def _extract_mentioned_user_ids(self, event: AstrMessageEvent) -> list:
         """Extract mentioned user ids from the message chain."""
@@ -380,17 +385,21 @@ class DailyLimitPlugin(star.Star):
 
         return mentioned_user_ids
 
-    def _build_newapi_command_help(self) -> str:
-        """构建 NewAPI 令牌命令帮助"""
+    def _build_xixi_token_help(self) -> str:
+        """构建西西令牌命令帮助"""
         return (
-            "🔑 NewAPI 令牌管理命令\n"
-            "══════════════════\n\n"
-            "• /limit newapi create @用户\n"
-            "  为被艾特用户创建 NewAPI 令牌，并按配置中的邮箱映射发送邮件通知。\n\n"
+            "🔑 西西令牌命令\n"
+            "════════════\n\n"
+            "• /西西令牌 创建 @用户\n"
+            "  为被艾特用户创建 NewAPI 令牌，并发送到 用户ID@qq.com。\n\n"
+            "• /西西令牌 充值 @用户 <额度>\n"
+            "  先查询当前已有额度，再为该用户绑定的令牌增加额度。\n\n"
+            "• /西西令牌 帮助\n"
+            "  查看本帮助。\n\n"
             "配置要求：\n"
             "1. 在 newapi_token_manager 中填写 NewAPI 管理接口配置\n"
-            "2. 在 newapi_token_manager.applicant_emails 中维护 用户ID:邮箱 映射\n"
-            "3. 在 mail 中填写 SMTP 发信配置"
+            "2. 在 mail 中填写 SMTP 发信配置\n"
+            "3. 创建成功后会自动维护 user_id -> token_id 绑定"
         )
 
     def _get_newapi_base_url(self) -> str:
@@ -516,6 +525,133 @@ class DailyLimitPlugin(star.Star):
 
         return token_name, payload
 
+    def _build_newapi_update_payload(
+        self, token_data: dict, overrides: dict | None = None
+    ) -> dict:
+        """构建更新令牌请求体"""
+        payload = {
+            "id": token_data.get("id"),
+            "name": token_data.get("name", ""),
+            "status": token_data.get("status", 1),
+            "remain_quota": token_data.get("remain_quota", 0),
+            "unlimited_quota": token_data.get("unlimited_quota", False),
+            "expired_time": token_data.get("expired_time", -1),
+            "model_limits_enabled": token_data.get("model_limits_enabled", False),
+            "model_limits": token_data.get("model_limits", []),
+            "allow_ips": token_data.get("allow_ips", ""),
+            "group": token_data.get("group", ""),
+        }
+
+        if overrides:
+            payload.update(overrides)
+
+        return payload
+
+    async def _search_newapi_token_by_name(self, token_name: str) -> dict | None:
+        """按名称搜索令牌"""
+        data = await self._request_newapi(
+            "GET", f"/api/token/search?keyword={quote(token_name)}"
+        )
+        token_list = data.get("data", []) if isinstance(data, dict) else []
+
+        if not isinstance(token_list, list):
+            return None
+
+        exact_matches = [
+            token
+            for token in token_list
+            if isinstance(token, dict)
+            and str(token.get("name", "")).strip() == token_name
+        ]
+        if exact_matches:
+            exact_matches.sort(key=lambda item: int(item.get("id", 0)), reverse=True)
+            return exact_matches[0]
+        return None
+
+    async def _get_newapi_token_detail(self, token_id: str) -> dict:
+        """获取令牌详情"""
+        data = await self._request_newapi("GET", f"/api/token/{token_id}")
+        token_data = data.get("data", {}) if isinstance(data, dict) else {}
+        if not isinstance(token_data, dict) or not token_data:
+            raise RuntimeError("未获取到令牌详情")
+        return token_data
+
+    async def _resolve_created_token_id(self, data: dict, token_name: str) -> str:
+        """解析创建后返回的令牌 ID"""
+        token_data = data.get("data", {}) if isinstance(data, dict) else {}
+        token_id = token_data.get("id") if isinstance(token_data, dict) else None
+
+        if token_id is not None and str(token_id).strip():
+            return str(token_id).strip()
+
+        searched_token = await self._search_newapi_token_by_name(token_name)
+        if searched_token and searched_token.get("id") is not None:
+            return str(searched_token["id"]).strip()
+
+        raise RuntimeError("NewAPI 创建成功但未返回令牌ID")
+
+    async def _update_newapi_token(self, token_id: str, overrides: dict) -> dict:
+        """更新令牌配置"""
+        token_data = await self._get_newapi_token_detail(token_id)
+        payload = self._build_newapi_update_payload(token_data, overrides)
+        await self._request_newapi("PUT", "/api/token/", payload)
+        return await self._get_newapi_token_detail(token_id)
+
+    def _save_user_token_binding(self, user_id: str, token_id: str) -> None:
+        """保存用户与令牌绑定"""
+        bindings = self._parse_user_token_bindings()
+        bindings[str(user_id)] = str(token_id)
+        lines = [f"{uid}:{tid}" for uid, tid in sorted(bindings.items())]
+        self.config["newapi_token_manager"]["token_bindings"] = "\n".join(lines)
+        self.config.save_config()
+
+    def _get_bound_token_id(self, user_id: str) -> str:
+        """获取用户绑定的令牌 ID"""
+        return str(
+            self._parse_user_token_bindings().get(str(user_id), "") or ""
+        ).strip()
+
+    def _get_user_qq_email(self, user_id: str) -> str:
+        """根据用户 ID 生成默认 QQ 邮箱"""
+        user_id = str(user_id).strip()
+        if not user_id:
+            raise ValueError("用户ID为空，无法生成邮箱地址")
+        return f"{user_id}@qq.com"
+
+    def _quota_to_raw(self, amount: str | int | float) -> int:
+        """将美元额度转换为 NewAPI 原始配额"""
+        quota_raw = int(float(amount) * 500000)
+        if quota_raw <= 0:
+            raise ValueError("额度必须大于 0")
+        return quota_raw
+
+    @staticmethod
+    def _format_quota(raw_quota: int | str | None) -> str:
+        """格式化额度展示"""
+        try:
+            value = int(raw_quota or 0) / 500000
+        except (TypeError, ValueError):
+            value = 0
+        return f"{value:.2f}"
+
+    def _token_has_available_quota(self, token_data: dict) -> bool:
+        """检查令牌是否还有可用额度"""
+        if int(token_data.get("status", 1) or 1) != 1:
+            return False
+        if bool(token_data.get("unlimited_quota", False)):
+            return True
+        return int(token_data.get("remain_quota", 0) or 0) > 0
+
+    async def _get_cached_newapi_token_key(self, token_id: str) -> str:
+        """优先从缓存获取令牌 key"""
+        token_id = str(token_id)
+        if token_id in self.newapi_token_key_cache:
+            return self.newapi_token_key_cache[token_id]
+
+        token_key = await self._fetch_newapi_token_key(token_id)
+        self.newapi_token_key_cache[token_id] = token_key
+        return token_key
+
     async def _fetch_newapi_token_key(self, token_id: str) -> str:
         """获取新创建令牌的完整 key"""
         data = await self._request_newapi("POST", f"/api/token/{token_id}/key")
@@ -533,14 +669,8 @@ class DailyLimitPlugin(star.Star):
         """创建令牌并获取完整 key"""
         token_name, payload = self._build_newapi_create_payload(applicant_user_id)
         data = await self._request_newapi("POST", "/api/token/", payload)
-        token_data = data.get("data", {}) if isinstance(data, dict) else {}
-        token_id = token_data.get("id")
-
-        if token_id is None or str(token_id).strip() == "":
-            raise RuntimeError("NewAPI 创建成功但未返回令牌ID")
-
-        token_id = str(token_id).strip()
-        token_key = await self._fetch_newapi_token_key(token_id)
+        token_id = await self._resolve_created_token_id(data, token_name)
+        token_key = await self._get_cached_newapi_token_key(token_id)
         return token_id, token_name, token_key
 
     @staticmethod
@@ -632,6 +762,78 @@ class DailyLimitPlugin(star.Star):
                 smtp.quit()
 
         await asyncio.to_thread(_send_mail)
+
+    async def _apply_user_token_to_llm_provider(self, event: AstrMessageEvent) -> bool:
+        """如果用户绑定的令牌有额度，则临时切换当前会话的 LLM Key，返回是否切换成功"""
+        user_id = str(event.get_sender_id() or "").strip()
+        if not user_id:
+            return False
+
+        token_id = self._get_bound_token_id(user_id)
+        if not token_id:
+            return False
+
+        try:
+            token_data = await self._get_newapi_token_detail(token_id)
+            if not self._token_has_available_quota(token_data):
+                return False
+
+            provider = self.context.get_using_provider(event.unified_msg_origin)
+            if (
+                not provider
+                or not hasattr(provider, "get_current_key")
+                or not hasattr(provider, "set_key")
+            ):
+                return False
+
+            await self.provider_key_switch_lock.acquire()
+            original_key = provider.get_current_key()
+            token_key = await self._get_cached_newapi_token_key(token_id)
+            provider.set_key(token_key)
+
+            event.set_extra("_dl_provider_key_switched", True)
+            event.set_extra("_dl_provider_original_key", original_key)
+            event.set_extra("_dl_provider_token_id", token_id)
+            event.set_extra(
+                "_dl_provider_restore_task",
+                asyncio.create_task(self._force_restore_llm_provider_key(event)),
+            )
+            return True
+        except Exception as e:
+            if self.provider_key_switch_lock.locked():
+                self.provider_key_switch_lock.release()
+            self._log_error(
+                "按用户令牌切换 LLM Key 失败 - 用户 {}: {}", user_id, str(e)
+            )
+            return False
+
+    async def _force_restore_llm_provider_key(
+        self, event: AstrMessageEvent, delay: int = 180
+    ) -> None:
+        """异常兜底：超时后强制恢复 provider key"""
+        await asyncio.sleep(delay)
+        await self._restore_llm_provider_key(event)
+
+    async def _restore_llm_provider_key(self, event: AstrMessageEvent) -> None:
+        """恢复临时切换的 provider key"""
+
+        try:
+            provider = self.context.get_using_provider(event.unified_msg_origin)
+            original_key = event.get_extra("_dl_provider_original_key", "")
+            if provider and original_key and hasattr(provider, "set_key"):
+                provider.set_key(original_key)
+        except Exception as e:
+            self._log_error("恢复 LLM Key 失败: {}", str(e))
+        finally:
+            restore_task = event.get_extra("_dl_provider_restore_task")
+            if restore_task and not restore_task.done():
+                restore_task.cancel()
+            event.set_extra("_dl_provider_key_switched", False)
+            event.set_extra("_dl_provider_original_key", "")
+            event.set_extra("_dl_provider_token_id", "")
+            event.set_extra("_dl_provider_restore_task", None)
+            if self.provider_key_switch_lock.locked():
+                self.provider_key_switch_lock.release()
 
     def _detect_abuse_behavior(self, user_id, timestamp=None):
         """检测异常使用行为
@@ -2072,19 +2274,36 @@ class DailyLimitPlugin(star.Star):
 
         # 检查限制
         if usage >= limit:
-            await self._handle_limit_exceeded(event, user_id, group_id, usage, limit)
-            return False
+            # 免费限制结束后，若用户绑定了有余额的令牌，则临时切换本次对话使用的 LLM Key 并放行
+            token_applied = await self._apply_user_token_to_llm_provider(event)
+            if token_applied:
+                return True
+            else:
+                await self._handle_limit_exceeded(
+                    event, user_id, group_id, usage, limit
+                )
+                return False
 
         # 发送提醒
         remaining = limit - usage
         if remaining in [1, 3, 5]:
             await self._send_reminder(event, user_id, group_id, remaining)
 
-        # 增加使用次数
+        # 增加免费使用次数
         self._increment_usage(user_id, group_id)
         self._record_usage(user_id, group_id, "llm_request")
 
         return True
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        """在 LLM 响应后恢复临时切换的 provider key"""
+        await self._restore_llm_provider_key(event)
+
+    @filter.after_message_sent()
+    async def after_message_sent(self, event: AstrMessageEvent):
+        """兜底恢复临时切换的 provider key"""
+        await self._restore_llm_provider_key(event)
 
     @filter.command("limit_status")
     async def limit_status(self, event: AstrMessageEvent):
@@ -2482,31 +2701,26 @@ class DailyLimitPlugin(star.Star):
         help_msg = self.help_manager.build_full_help()
         event.set_result(MessageEventResult().message(help_msg))
 
+    @filter.command_group("西西令牌")
+    def xixi_token_group(self):
+        """西西令牌命令组"""
+        pass
+
     @filter.permission_type(PermissionType.ADMIN)
-    @limit_command_group.command("newapi")
-    async def limit_newapi(self, event: AstrMessageEvent):
-        """管理申请人的 NewAPI 令牌（仅管理员）"""
+    @xixi_token_group.command("帮助")
+    async def xixi_token_help(self, event: AstrMessageEvent):
+        """显示西西令牌帮助（仅管理员）"""
+        event.set_result(MessageEventResult().message(self._build_xixi_token_help()))
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @xixi_token_group.command("创建")
+    async def xixi_token_create(self, event: AstrMessageEvent):
+        """为被艾特用户创建令牌（仅管理员）"""
         args = event.message_str.strip().split()
 
-        if len(args) < 3:
+        if len(args) < 2:
             event.set_result(
-                MessageEventResult().message(self._build_newapi_command_help())
-            )
-            return
-
-        action = args[2]
-
-        if action == "help":
-            event.set_result(
-                MessageEventResult().message(self._build_newapi_command_help())
-            )
-            return
-
-        if action != "create":
-            event.set_result(
-                MessageEventResult().message(
-                    "❌ 无效的 NewAPI 命令，请使用 /limit newapi help 查看帮助"
-                )
+                MessageEventResult().message(self._build_xixi_token_help())
             )
             return
 
@@ -2514,7 +2728,7 @@ class DailyLimitPlugin(star.Star):
         if not mentioned_user_ids:
             event.set_result(
                 MessageEventResult().message(
-                    "❌ 请在命令中艾特申请人，例如：/limit newapi create @用户"
+                    "❌ 请在命令中艾特申请人，例如：/西西令牌 创建 @用户"
                 )
             )
             return
@@ -2526,15 +2740,7 @@ class DailyLimitPlugin(star.Star):
             return
 
         applicant_user_id = mentioned_user_ids[0]
-        applicant_email = self._parse_applicant_email_mapping().get(applicant_user_id)
-
-        if not applicant_email:
-            event.set_result(
-                MessageEventResult().message(
-                    f"❌ 未在邮箱映射中找到用户 {applicant_user_id} 的邮箱，请先在配置项 applicant_emails 中维护映射"
-                )
-            )
-            return
+        applicant_email = self._get_user_qq_email(applicant_user_id)
 
         try:
             token_id, token_name, token_key = await self._create_newapi_token(
@@ -2546,6 +2752,19 @@ class DailyLimitPlugin(star.Star):
             )
             event.set_result(
                 MessageEventResult().message(f"❌ 创建 NewAPI 令牌失败：{str(e)}")
+            )
+            return
+
+        try:
+            self._save_user_token_binding(applicant_user_id, token_id)
+        except Exception as e:
+            self._log_error(
+                "保存用户令牌绑定失败 - 用户 {}: {}", applicant_user_id, str(e)
+            )
+            event.set_result(
+                MessageEventResult().message(
+                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），但保存绑定失败：{str(e)}"
+                )
             )
             return
 
@@ -2569,6 +2788,78 @@ class DailyLimitPlugin(star.Star):
         event.set_result(
             MessageEventResult().message(
                 f"✅ 已为用户 {applicant_user_id} 创建 NewAPI 令牌（ID: {token_id}），并已发送邮件到 {applicant_email}"
+            )
+        )
+
+    @filter.permission_type(PermissionType.ADMIN)
+    @xixi_token_group.command("充值")
+    async def xixi_token_recharge(self, event: AstrMessageEvent, amount: str = None):
+        """为被艾特用户绑定的令牌充值额度（仅管理员）"""
+        args = event.message_str.strip().split()
+        mentioned_user_ids = self._extract_mentioned_user_ids(event)
+        if not mentioned_user_ids:
+            event.set_result(
+                MessageEventResult().message(
+                    "❌ 请在命令中艾特申请人，例如：/西西令牌 充值 @用户 10"
+                )
+            )
+            return
+
+        if len(mentioned_user_ids) > 1:
+            event.set_result(
+                MessageEventResult().message("❌ 一次只能为一个被艾特用户的令牌充值")
+            )
+            return
+
+        if amount is None:
+            if args:
+                candidate = args[-1]
+                if candidate not in {"充值", "帮助"}:
+                    amount = candidate
+
+        if amount is None:
+            event.set_result(
+                MessageEventResult().message("❌ 用法：/西西令牌 充值 @用户 <额度>")
+            )
+            return
+
+        applicant_user_id = mentioned_user_ids[0]
+        token_id = self._get_bound_token_id(applicant_user_id)
+        if not token_id:
+            event.set_result(
+                MessageEventResult().message(
+                    f"❌ 用户 {applicant_user_id} 尚未绑定令牌，请先执行 /西西令牌 创建 @用户"
+                )
+            )
+            return
+
+        try:
+            token_data = await self._get_newapi_token_detail(token_id)
+            recharge_raw = self._quota_to_raw(amount)
+            if bool(token_data.get("unlimited_quota", False)):
+                event.set_result(
+                    MessageEventResult().message(
+                        f"ℹ️ 用户 {applicant_user_id} 绑定的令牌（ID: {token_id}）当前为不限额，无需充值"
+                    )
+                )
+                return
+
+            current_raw = int(token_data.get("remain_quota", 0) or 0)
+            updated_raw = current_raw + recharge_raw
+            await self._update_newapi_token(token_id, {"remain_quota": updated_raw})
+        except Exception as e:
+            self._log_error("为令牌充值失败 - 用户 {}: {}", applicant_user_id, str(e))
+            event.set_result(
+                MessageEventResult().message(f"❌ 为令牌充值失败：{str(e)}")
+            )
+            return
+
+        event.set_result(
+            MessageEventResult().message(
+                f"✅ 已为用户 {applicant_user_id} 绑定的令牌（ID: {token_id}）充值成功\n"
+                f"• 充值前额度：{self._format_quota(current_raw)}\n"
+                f"• 本次增加额度：{self._format_quota(recharge_raw)}\n"
+                f"• 充值后额度：{self._format_quota(updated_raw)}"
             )
         )
 
