@@ -550,7 +550,7 @@ class DailyLimitPlugin(star.Star):
     async def _search_newapi_token_by_name(self, token_name: str) -> dict | None:
         """按名称搜索令牌"""
         data = await self._request_newapi(
-            "GET", f"/api/token/search?keyword={quote(token_name)}"
+            "GET", f"/api/token/?keyword={quote(token_name)}"
         )
         token_list = data.get("data", []) if isinstance(data, dict) else []
 
@@ -584,11 +584,14 @@ class DailyLimitPlugin(star.Star):
         if token_id is not None and str(token_id).strip():
             return str(token_id).strip()
 
-        searched_token = await self._search_newapi_token_by_name(token_name)
-        if searched_token and searched_token.get("id") is not None:
-            return str(searched_token["id"]).strip()
+        # NewAPI 可能有写入延迟，尝试轮询查询几次
+        for _ in range(3):
+            await asyncio.sleep(0.5)
+            searched_token = await self._search_newapi_token_by_name(token_name)
+            if searched_token and searched_token.get("id") is not None:
+                return str(searched_token["id"]).strip()
 
-        raise RuntimeError("NewAPI 创建成功但未返回令牌ID")
+        raise RuntimeError("NewAPI 创建成功但未返回令牌ID，且通过名称未能查到新令牌。")
 
     async def _update_newapi_token(self, token_id: str, overrides: dict) -> dict:
         """更新令牌配置"""
