@@ -369,6 +369,36 @@
                 "type": "text",
                 "default": "",
                 "hint": "系统自动维护的用户与 NewAPI 令牌绑定关系，每行格式为：用户ID:sk-xxxx"
+            },
+            "access_token": {
+                "description": "NewAPI管理访问令牌",
+                "type": "string",
+                "default": "",
+                "hint": "用于调用NewAPI管理接口创建令牌"
+            },
+            "user_id": {
+                "description": "NewAPI用户ID",
+                "type": "string",
+                "default": "",
+                "hint": "请求头 New-Api-User 的值"
+            },
+            "default_group": {
+                "description": "默认令牌分组",
+                "type": "string",
+                "default": "",
+                "hint": "创建令牌时默认分配的分组，留空表示使用系统默认分组"
+            },
+            "default_quota_usd": {
+                "description": "默认额度（美元）",
+                "type": "string",
+                "default": "",
+                "hint": "留空表示不限额；填写例如 10 或 20.5"
+            },
+            "token_name_prefix": {
+                "description": "令牌名前缀",
+                "type": "string",
+                "default": "astrbot-applicant",
+                "hint": "实际令牌名格式为：前缀-用户ID-时间戳"
             }
         }
     }
