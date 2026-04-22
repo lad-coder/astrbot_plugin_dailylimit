@@ -355,113 +355,20 @@
         }
     },
     "newapi_token_manager": {
-        "description": "NewAPI令牌创建配置",
+        "description": "NewAPI令牌管理（用于自动为超限用户替换专属额度）",
         "type": "object",
         "items": {
             "base_url": {
                 "description": "NewAPI管理接口地址",
                 "type": "string",
                 "default": "",
-                "hint": "例如：https://your-newapi.example.com"
-            },
-            "api_base_url": {
-                "description": "发给申请人的API Base URL",
-                "type": "string",
-                "default": "",
-                "hint": "邮件中展示给申请人的接口地址，例如：https://your-newapi.example.com/v1；留空时自动使用 base_url/v1"
-            },
-            "access_token": {
-                "description": "NewAPI管理访问令牌",
-                "type": "string",
-                "default": "",
-                "hint": "用于调用NewAPI管理接口创建令牌"
-            },
-            "user_id": {
-                "description": "NewAPI用户ID",
-                "type": "string",
-                "default": "",
-                "hint": "请求头 New-Api-User 的值"
-            },
-            "default_group": {
-                "description": "默认令牌分组",
-                "type": "string",
-                "default": "",
-                "hint": "创建令牌时默认分配的分组，留空表示使用系统默认分组"
-            },
-            "default_quota_usd": {
-                "description": "默认额度（美元）",
-                "type": "string",
-                "default": "",
-                "hint": "留空表示不限额；填写例如 10 或 20.5"
-            },
-            "token_name_prefix": {
-                "description": "令牌名前缀",
-                "type": "string",
-                "default": "astrbot-applicant",
-                "hint": "实际令牌名格式为：前缀-用户ID-时间戳"
+                "hint": "用于检查令牌额度的 Base URL，例如 http://localhost:3000"
             },
             "token_bindings": {
                 "description": "用户与令牌绑定",
                 "type": "text",
                 "default": "",
-                "hint": "格式：用户ID:令牌ID，一行一个。创建令牌成功后会自动维护。\n示例：\n123456789:1001\n987654321:1002"
-            }
-        }
-    },
-    "mail": {
-        "description": "邮件通知配置",
-        "type": "object",
-        "items": {
-            "smtp_host": {
-                "description": "SMTP服务器地址",
-                "type": "string",
-                "default": ""
-            },
-            "smtp_port": {
-                "description": "SMTP端口",
-                "type": "int",
-                "default": 465
-            },
-            "smtp_username": {
-                "description": "SMTP用户名",
-                "type": "string",
-                "default": "",
-                "hint": "留空表示不登录SMTP服务器"
-            },
-            "smtp_password": {
-                "description": "SMTP密码",
-                "type": "string",
-                "default": ""
-            },
-            "from_email": {
-                "description": "发件人邮箱",
-                "type": "string",
-                "default": "",
-                "hint": "留空时默认使用 smtp_username"
-            },
-            "use_ssl": {
-                "description": "启用SSL",
-                "type": "bool",
-                "default": true,
-                "hint": "通常465端口使用SSL"
-            },
-            "use_tls": {
-                "description": "启用STARTTLS",
-                "type": "bool",
-                "default": false,
-                "hint": "通常587端口使用STARTTLS；启用SSL时会忽略此项"
-            },
-            "subject_template": {
-                "description": "邮件主题模板",
-                "type": "string",
-                "default": "您的 NewAPI 令牌已创建",
-                "hint": "支持变量：{applicant_user_id}、{token_id}、{token_name}、{current_time}"
-            },
-            "body_template": {
-                "description": "邮件正文模板",
-                "type": "text",
-                "default": "您好，您的 NewAPI 令牌已创建成功。\n\n用户ID：{applicant_user_id}\n令牌名称：{token_name}\n令牌ID：{token_id}\n令牌：{token}\nAPI Base URL：{api_base_url}\n\n请妥善保管此令牌，避免泄露。",
-                "hint": "支持变量：{applicant_user_id}、{applicant_email}、{token_id}、{token_name}、{token}、{base_url}、{api_base_url}、{current_time}"
+                "hint": "系统自动维护的用户与 NewAPI 令牌绑定关系，每行格式为：用户ID:sk-xxxx"
             }
         }
     }

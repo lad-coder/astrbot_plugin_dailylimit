@@ -3,13 +3,9 @@ import datetime
 import importlib.util
 import json
 import os
-import smtplib
 import sys
 import time
-from email.message import EmailMessage
-from urllib.parse import quote
 
-import aiohttp
 import httpx
 
 import astrbot.api.star as star  # type: ignore
@@ -391,210 +387,20 @@ class DailyLimitPlugin(star.Star):
         return (
             "🔑 西西令牌命令\n"
             "════════════\n\n"
-            "• /西西令牌 创建 @用户\n"
-            "  为被艾特用户创建 NewAPI 令牌，并发送到 用户ID@qq.com。\n\n"
-            "• /西西令牌 充值 @用户 <额度>\n"
-            "  先查询当前已有额度，再为该用户绑定的令牌增加额度。\n\n"
+            "• /西西令牌 绑定 @用户 sk-xxxx\n"
+            "  为被艾特用户绑定后台已创建的 NewAPI 密钥。\n\n"
+            "• /西西令牌 绑定 <用户ID> sk-xxxx\n"
+            "  直接通过用户 ID 为其绑定 NewAPI 密钥。\n\n"
             "• /西西令牌 帮助\n"
             "  查看本帮助。\n\n"
-            "配置要求：\n"
-            "1. 在 newapi_token_manager 中填写 NewAPI 管理接口配置\n"
-            "2. 在 mail 中填写 SMTP 发信配置\n"
-            "3. 创建成功后会自动维护 user_id -> token_id 绑定"
+            "说明：\n"
+            "当用户触发每日额度限制时，系统会自动使用其绑定的专属 Key 替换调用额度。\n"
+            "需在配置 newapi_token_manager.base_url 中填写网关地址用于查询余额。"
         )
 
-    def _get_newapi_base_url(self) -> str:
-        """获取 NewAPI 管理接口地址"""
-        base_url = str(
-            self._get_newapi_manager_config().get("base_url", "") or ""
-        ).strip()
-        return base_url.rstrip("/")
-
-    def _get_newapi_api_base_url(self) -> str:
-        """获取发给申请人的 API Base URL"""
-        config = self._get_newapi_manager_config()
-        api_base_url = str(config.get("api_base_url", "") or "").strip()
-
-        if api_base_url:
-            return api_base_url.rstrip("/")
-
-        base_url = self._get_newapi_base_url()
-        if not base_url:
-            return ""
-
-        return f"{base_url}/v1"
-
-    def _build_newapi_headers(self) -> dict:
-        """构建 NewAPI 请求头"""
-        config = self._get_newapi_manager_config()
-        base_url = self._get_newapi_base_url()
-        access_token = str(config.get("access_token", "") or "").strip()
-        user_id = str(config.get("user_id", "") or "").strip()
-
-        if not base_url:
-            raise ValueError(
-                "未配置 NewAPI 管理地址，请填写 newapi_token_manager.base_url"
-            )
-        if not access_token:
-            raise ValueError(
-                "未配置 NewAPI 管理访问令牌，请填写 newapi_token_manager.access_token"
-            )
-        if not user_id:
-            raise ValueError(
-                "未配置 NewAPI 用户ID，请填写 newapi_token_manager.user_id"
-            )
-
-        return {
-            "Authorization": f"Bearer {access_token}",
-            "New-Api-User": user_id,
-        }
-
-    @staticmethod
-    def _parse_newapi_error_message(payload, fallback_message: str) -> str:
-        """解析 NewAPI 错误消息"""
-        if isinstance(payload, dict):
-            message = payload.get("message")
-            if message:
-                return str(message)
-        return fallback_message
-
-    async def _request_newapi(
-        self, method: str, path: str, payload: dict = None
-    ) -> dict:
-        """调用 NewAPI 管理接口"""
-        url = f"{self._get_newapi_base_url()}{path}"
-        headers = self._build_newapi_headers()
-        timeout = aiohttp.ClientTimeout(total=30)
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                json=payload,
-            ) as response:
-                response_text = await response.text()
-
-        try:
-            data = json.loads(response_text) if response_text else {}
-        except json.JSONDecodeError:
-            data = {"message": response_text}
-
-        if response.status >= 400:
-            message = self._parse_newapi_error_message(
-                data, f"NewAPI 请求失败（HTTP {response.status}）"
-            )
-            raise RuntimeError(message)
-
-        if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(
-                self._parse_newapi_error_message(data, "NewAPI 返回失败")
-            )
-
-        return data if isinstance(data, dict) else {}
-
-    def _build_newapi_token_name(self, applicant_user_id: str) -> str:
-        """生成令牌名称"""
-        config = self._get_newapi_manager_config()
-        prefix = str(config.get("token_name_prefix", "") or "").strip()
-        if not prefix:
-            prefix = "astrbot-applicant"
-
-        timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
-        return f"{prefix}-{applicant_user_id}-{timestamp}"
-
-    def _build_newapi_create_payload(self, applicant_user_id: str) -> tuple:
-        """构建创建令牌请求体"""
-        config = self._get_newapi_manager_config()
-        token_name = self._build_newapi_token_name(applicant_user_id)
-        payload = {
-            "name": token_name,
-            "unlimited_quota": True,
-        }
-
-        default_group = str(config.get("default_group", "") or "").strip()
-        if default_group:
-            payload["group"] = default_group
-
-        quota_text = str(config.get("default_quota_usd", "") or "").strip()
-        if quota_text:
-            quota_raw = int(float(quota_text) * 500000)
-            if quota_raw < 0:
-                raise ValueError("default_quota_usd 不能为负数")
-            payload["remain_quota"] = quota_raw
-            payload["unlimited_quota"] = False
-
-        return token_name, payload
-
-    def _build_newapi_update_payload(
-        self, token_data: dict, overrides: dict | None = None
-    ) -> dict:
-        """构建更新令牌请求体"""
-        payload = {
-            "id": token_data.get("id"),
-            "name": token_data.get("name", ""),
-            "status": token_data.get("status", 1),
-            "remain_quota": token_data.get("remain_quota", 0),
-            "unlimited_quota": token_data.get("unlimited_quota", False),
-            "expired_time": token_data.get("expired_time", -1),
-            "model_limits_enabled": token_data.get("model_limits_enabled", False),
-            "model_limits": token_data.get("model_limits", []),
-            "allow_ips": token_data.get("allow_ips", ""),
-            "group": token_data.get("group", ""),
-        }
-
-        if overrides:
-            payload.update(overrides)
-
-        return payload
-
-    async def _search_newapi_token_by_name(self, token_name: str) -> dict | None:
-        """按名称搜索令牌"""
-        data = await self._request_newapi(
-            "GET", f"/api/token/?keyword={quote(token_name)}"
-        )
-        token_list = data.get("data", []) if isinstance(data, dict) else []
-
-        if not isinstance(token_list, list):
-            return None
-
-        exact_matches = [
-            token
-            for token in token_list
-            if isinstance(token, dict)
-            and str(token.get("name", "")).strip() == token_name
-        ]
-        if exact_matches:
-            exact_matches.sort(key=lambda item: int(item.get("id", 0)), reverse=True)
-            return exact_matches[0]
-        return None
-
-    async def _get_newapi_token_detail_by_key(self, token_key: str) -> dict:
-        """通过 key 的特征（如名称或搜索）找到对应的令牌详情"""
-        # 由于我们只保存了 key，需要通过 key 去搜索 id
-        # NewAPI 可以通过 keyword 搜索 token
-        # 通常 key 的前缀或中间部分可以作为 keyword
-        search_key = token_key.replace("sk-", "")
-
-        # 截取一部分作为 keyword 搜索，避免太长搜不到
-        keyword = search_key[:12] if len(search_key) > 12 else search_key
-
-        data = await self._request_newapi(
-            "GET", f"/api/token/?keyword={quote(keyword)}"
-        )
-        token_list = data.get("data", []) if isinstance(data, dict) else []
-        if not isinstance(token_list, list):
-            raise RuntimeError("未找到对应令牌")
-
-        for token in token_list:
-            # 找到对应 key
-            if (
-                isinstance(token, dict)
-                and str(token.get("key", "")).strip() == search_key
-            ):
-                return token
-
-        raise RuntimeError("未找到对应令牌（可能是 key 已失效或搜索不匹配）")
+    def _get_newapi_manager_config(self) -> dict:
+        """获取 NewAPI 管理器配置"""
+        return self.config.get("newapi_token_manager", {})
 
     async def _get_token_quota_info_by_key(self, token_key: str) -> dict:
         """通过大模型订阅接口获取令牌真实额度"""
@@ -631,16 +437,6 @@ class DailyLimitPlugin(star.Star):
         # 考虑到不同魔改版可能字段不同，暂时只判断 hard_limit_usd 是否大于 0
         return True
 
-    async def _update_newapi_token_by_key(
-        self, token_key: str, overrides: dict
-    ) -> dict:
-        """更新令牌配置（通过 key 查找后更新）"""
-        token_data = await self._get_newapi_token_detail_by_key(token_key)
-
-        payload = self._build_newapi_update_payload(token_data, overrides)
-        await self._request_newapi("PUT", "/api/token/", payload)
-        return await self._get_newapi_token_detail_by_key(token_key)
-
     def _save_user_token_binding(self, user_id: str, token_key: str) -> None:
         """保存用户与令牌绑定（直接保存密钥）"""
         bindings = self._parse_user_token_bindings()
@@ -654,152 +450,6 @@ class DailyLimitPlugin(star.Star):
         return str(
             self._parse_user_token_bindings().get(str(user_id), "") or ""
         ).strip()
-
-    def _get_user_qq_email(self, user_id: str) -> str:
-        """根据用户 ID 生成默认 QQ 邮箱"""
-        user_id = str(user_id).strip()
-        if not user_id:
-            raise ValueError("用户ID为空，无法生成邮箱地址")
-        return f"{user_id}@qq.com"
-
-    def _quota_to_raw(self, amount: str | int | float) -> int:
-        """将美元额度转换为 NewAPI 原始配额"""
-        quota_raw = int(float(amount) * 500000)
-        if quota_raw <= 0:
-            raise ValueError("额度必须大于 0")
-        return quota_raw
-
-    @staticmethod
-    def _format_quota(raw_quota: int | str | None) -> str:
-        """格式化额度展示"""
-        try:
-            value = int(raw_quota or 0) / 500000
-        except (TypeError, ValueError):
-            value = 0
-        return f"{value:.2f}"
-
-    def _token_has_available_quota(self, token_data: dict) -> bool:
-        """检查令牌是否还有可用额度"""
-        if int(token_data.get("status", 1) or 1) != 1:
-            return False
-        if bool(token_data.get("unlimited_quota", False)):
-            return True
-        return int(token_data.get("remain_quota", 0) or 0) > 0
-
-    async def _create_newapi_token(self, applicant_user_id: str) -> tuple:
-        """创建令牌并直接返回完整 key（不查询 ID）"""
-        token_name, payload = self._build_newapi_create_payload(applicant_user_id)
-        data = await self._request_newapi("POST", "/api/token/", payload)
-
-        # 尝试从 data 解析 key
-        token_data = data.get("data")
-        raw_key = ""
-
-        if isinstance(token_data, dict):
-            raw_key = str(token_data.get("key", "") or "").strip()
-        elif isinstance(token_data, str) and token_data.strip():
-            raw_key = token_data.strip()
-
-        if not raw_key:
-            # 如果接口没有直接返回 key，可能是非标准魔改版或异常
-            # 兼容：尝试从返回信息或者其他字段取，或直接抛错
-            raise RuntimeError(
-                "NewAPI 创建成功但未在返回数据中获取到直接的 key。请确认你的 NewAPI 版本是否直接返回密钥。"
-            )
-
-        token_key = raw_key if raw_key.startswith("sk-") else f"sk-{raw_key}"
-        # 返回假 ID 即可，因为后续查询不再依赖 token_id
-        return "unknown", token_name, token_key
-
-    @staticmethod
-    def _safe_format_template(template: str, variables: dict) -> str:
-        """Safely format a template without raising on missing keys."""
-
-        class SafeDict(dict):
-            def __missing__(self, key):
-                return "{" + key + "}"
-
-        return str(template).format_map(SafeDict(variables))
-
-    async def _send_newapi_token_email(
-        self,
-        applicant_user_id: str,
-        applicant_email: str,
-        token_id: str,
-        token_name: str,
-        token_key: str,
-    ) -> None:
-        """发送令牌邮件通知"""
-        mail_config = self._get_mail_config()
-        smtp_host = str(mail_config.get("smtp_host", "") or "").strip()
-        smtp_port = int(mail_config.get("smtp_port", 465) or 465)
-        smtp_username = str(mail_config.get("smtp_username", "") or "").strip()
-        smtp_password = str(mail_config.get("smtp_password", "") or "").strip()
-        from_email = (
-            str(mail_config.get("from_email", "") or "").strip() or smtp_username
-        )
-        use_ssl = bool(mail_config.get("use_ssl", True))
-        use_tls = bool(mail_config.get("use_tls", False))
-
-        if not smtp_host:
-            raise ValueError("未配置 SMTP 主机，请填写 mail.smtp_host")
-        if not from_email:
-            raise ValueError("未配置发件人邮箱，请填写 mail.from_email")
-        if smtp_username and not smtp_password:
-            raise ValueError("已配置 SMTP 用户名，但缺少 mail.smtp_password")
-
-        subject_template = str(
-            mail_config.get("subject_template", "") or "您的 NewAPI 令牌已创建"
-        )
-        body_template = str(
-            mail_config.get("body_template", "")
-            or (
-                "您好，您的 NewAPI 令牌已创建成功。\n\n"
-                "用户ID：{applicant_user_id}\n"
-                "令牌名称：{token_name}\n"
-                "令牌ID：{token_id}\n"
-                "令牌：{token}\n"
-                "API Base URL：{api_base_url}\n\n"
-                "请妥善保管此令牌，避免泄露。"
-            )
-        )
-
-        template_vars = {
-            "applicant_user_id": applicant_user_id,
-            "applicant_email": applicant_email,
-            "token_id": token_id,
-            "token_name": token_name,
-            "token": token_key,
-            "base_url": self._get_newapi_base_url(),
-            "api_base_url": self._get_newapi_api_base_url(),
-            "current_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        }
-
-        subject = self._safe_format_template(subject_template, template_vars)
-        body = self._safe_format_template(body_template, template_vars)
-
-        message = EmailMessage()
-        message["Subject"] = subject
-        message["From"] = from_email
-        message["To"] = applicant_email
-        message.set_content(body)
-
-        def _send_mail():
-            if use_ssl:
-                smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
-            else:
-                smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
-
-            try:
-                if use_tls and not use_ssl:
-                    smtp.starttls()
-                if smtp_username:
-                    smtp.login(smtp_username, smtp_password)
-                smtp.send_message(message)
-            finally:
-                smtp.quit()
-
-        await asyncio.to_thread(_send_mail)
 
     async def _apply_user_token_to_llm_provider(self, event: AstrMessageEvent) -> bool:
         """如果用户绑定的令牌有额度，则临时切换当前会话的 LLM Key，返回是否切换成功"""
@@ -2754,156 +2404,52 @@ class DailyLimitPlugin(star.Star):
         event.set_result(MessageEventResult().message(self._build_xixi_token_help()))
 
     @filter.permission_type(PermissionType.ADMIN)
-    @xixi_token_group.command("创建")
-    async def xixi_token_create(self, event: AstrMessageEvent):
-        """为被艾特用户创建令牌（仅管理员）"""
+    @xixi_token_group.command("绑定")
+    async def xixi_token_bind(self, event: AstrMessageEvent):
+        """为用户绑定后台已创建的令牌密钥（仅管理员）"""
         args = event.message_str.strip().split()
-
         if len(args) < 2:
             event.set_result(
-                MessageEventResult().message(self._build_xixi_token_help())
+                MessageEventResult().message(
+                    "❌ 用法：\n/西西令牌 绑定 @用户 sk-xxxx\n/西西令牌 绑定 <用户ID> sk-xxxx"
+                )
             )
             return
 
+        token_key = args[-1]
+
+        # 提取用户ID：如果有艾特则取艾特，否则取倒数第二个参数作为用户ID
         mentioned_user_ids = self._extract_mentioned_user_ids(event)
-        if not mentioned_user_ids:
-            event.set_result(
-                MessageEventResult().message(
-                    "❌ 请在命令中艾特申请人，例如：/西西令牌 创建 @用户"
-                )
-            )
-            return
-
-        if len(mentioned_user_ids) > 1:
-            event.set_result(
-                MessageEventResult().message("❌ 一次只能为一个被艾特用户创建令牌")
-            )
-            return
-
-        applicant_user_id = mentioned_user_ids[0]
-        applicant_email = self._get_user_qq_email(applicant_user_id)
-
-        try:
-            token_id, token_name, token_key = await self._create_newapi_token(
-                applicant_user_id
-            )
-        except Exception as e:
-            self._log_error(
-                "创建 NewAPI 令牌失败 - 用户 {}: {}", applicant_user_id, str(e)
-            )
-            event.set_result(
-                MessageEventResult().message(f"❌ 创建 NewAPI 令牌失败：{str(e)}")
-            )
-            return
-
-        try:
-            # 修改为保存 key
-            self._save_user_token_binding(applicant_user_id, token_key)
-        except Exception as e:
-            self._log_error(
-                "保存用户令牌绑定失败 - 用户 {}: {}", applicant_user_id, str(e)
-            )
-            event.set_result(
-                MessageEventResult().message(
-                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌，但保存绑定失败：{str(e)}"
-                )
-            )
-            return
-
-        try:
-            await self._send_newapi_token_email(
-                applicant_user_id=applicant_user_id,
-                applicant_email=applicant_email,
-                token_id=token_id,
-                token_name=token_name,
-                token_key=token_key,
-            )
-        except Exception as e:
-            self._log_error("令牌邮件发送失败 - 用户 {}: {}", applicant_user_id, str(e))
-            event.set_result(
-                MessageEventResult().message(
-                    f"⚠️ 已为用户 {applicant_user_id} 创建 NewAPI 令牌，但邮件发送失败：{str(e)}"
-                )
-            )
-            return
-
-        event.set_result(
-            MessageEventResult().message(
-                f"✅ 已为用户 {applicant_user_id} 创建 NewAPI 令牌，并已发送邮件到 {applicant_email}"
-            )
-        )
-
-    @filter.permission_type(PermissionType.ADMIN)
-    @xixi_token_group.command("充值")
-    async def xixi_token_recharge(self, event: AstrMessageEvent, amount: str = None):
-        """为被艾特用户绑定的令牌充值额度（仅管理员）"""
-        args = event.message_str.strip().split()
-        mentioned_user_ids = self._extract_mentioned_user_ids(event)
-        if not mentioned_user_ids:
-            event.set_result(
-                MessageEventResult().message(
-                    "❌ 请在命令中艾特申请人，例如：/西西令牌 充值 @用户 10"
-                )
-            )
-            return
-
-        if len(mentioned_user_ids) > 1:
-            event.set_result(
-                MessageEventResult().message("❌ 一次只能为一个被艾特用户的令牌充值")
-            )
-            return
-
-        if amount is None:
-            if args:
-                candidate = args[-1]
-                if candidate not in {"充值", "帮助"}:
-                    amount = candidate
-
-        if amount is None:
-            event.set_result(
-                MessageEventResult().message("❌ 用法：/西西令牌 充值 @用户 <额度>")
-            )
-            return
-
-        applicant_user_id = mentioned_user_ids[0]
-        token_id = self._get_bound_token_id(applicant_user_id)
-        if not token_id:
-            event.set_result(
-                MessageEventResult().message(
-                    f"❌ 用户 {applicant_user_id} 尚未绑定令牌，请先执行 /西西令牌 创建 @用户"
-                )
-            )
-            return
-
-        try:
-            token_data = await self._get_newapi_token_detail(token_id)
-            recharge_raw = self._quota_to_raw(amount)
-            if bool(token_data.get("unlimited_quota", False)):
+        if mentioned_user_ids:
+            if len(mentioned_user_ids) > 1:
+                event.set_result(MessageEventResult().message("❌ 每次只能为一个用户绑定。"))
+                return
+            applicant_user_id = str(mentioned_user_ids[0])
+        else:
+            # 没有艾特，那倒数第二个参数就是用户ID
+            if len(args) >= 3:
+                applicant_user_id = args[-2]
+            else:
                 event.set_result(
                     MessageEventResult().message(
-                        f"ℹ️ 用户 {applicant_user_id} 绑定的令牌（ID: {token_id}）当前为不限额，无需充值"
+                        "❌ 请指定用户ID或艾特用户，例如：/西西令牌 绑定 123456 sk-xxxx"
                     )
                 )
                 return
 
-            current_raw = int(token_data.get("remain_quota", 0) or 0)
-            updated_raw = current_raw + recharge_raw
-            await self._update_newapi_token(token_id, {"remain_quota": updated_raw})
-        except Exception as e:
-            self._log_error("为令牌充值失败 - 用户 {}: {}", applicant_user_id, str(e))
-            event.set_result(
-                MessageEventResult().message(f"❌ 为令牌充值失败：{str(e)}")
-            )
-            return
+        if not token_key.startswith("sk-"):
+            token_key = f"sk-{token_key}"
 
-        event.set_result(
-            MessageEventResult().message(
-                f"✅ 已为用户 {applicant_user_id} 绑定的令牌（ID: {token_id}）充值成功\n"
-                f"• 充值前额度：{self._format_quota(current_raw)}\n"
-                f"• 本次增加额度：{self._format_quota(recharge_raw)}\n"
-                f"• 充值后额度：{self._format_quota(updated_raw)}"
+        try:
+            self._save_user_token_binding(applicant_user_id, token_key)
+            event.set_result(
+                MessageEventResult().message(
+                    f"✅ 已成功为用户 {applicant_user_id} 绑定密钥。"
+                )
             )
-        )
+        except Exception as e:
+            self._log_error("为用户 {} 绑定密钥失败: {}", applicant_user_id, str(e))
+            event.set_result(MessageEventResult().message(f"❌ 绑定失败：{str(e)}"))
 
     @limit_command_group.command("set")
     async def limit_set(
